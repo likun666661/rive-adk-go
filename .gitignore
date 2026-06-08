@@ -3,3 +3,4 @@
 .codex/
 *.test
 coverage.out
+/demo

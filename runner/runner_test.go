@@ -5,9 +5,11 @@ import (
 	"testing"
 
 	"github.com/likun666661/rive-adk-go/agent"
+	"github.com/likun666661/rive-adk-go/artifact"
 	"github.com/likun666661/rive-adk-go/event"
 	"github.com/likun666661/rive-adk-go/flow"
 	"github.com/likun666661/rive-adk-go/llmagent"
+	"github.com/likun666661/rive-adk-go/memory"
 	"github.com/likun666661/rive-adk-go/model"
 	"github.com/likun666661/rive-adk-go/tool"
 )
@@ -60,6 +62,33 @@ func newTestRunnerWithTools(t *testing.T, name string, tools map[string]tool.Fun
 		AppName:        "testapp",
 		Agent:          ea,
 		SessionService: NewInMemorySessionService(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+// newTestRunnerWithServices creates a runner with memory and artifact services.
+func newTestRunnerWithServices(t *testing.T, name string, memSvc memory.Service, artSvc artifact.Service, agentResponses ...*model.LLMResponse) *Runner {
+	t.Helper()
+	fm := model.NewFakeModel("fake", agentResponses...)
+	f := &flow.Flow{Model: fm}
+	ag, err := llmagent.New(name, "test agent", f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var a agent.Agent = ag
+	ea, ok := a.(ExecutableAgent)
+	if !ok {
+		t.Fatal("agent does not implement ExecutableAgent")
+	}
+	r, err := New(Config{
+		AppName:         "testapp",
+		Agent:           ea,
+		SessionService:  NewInMemorySessionService(),
+		MemoryService:   memSvc,
+		ArtifactService: artSvc,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -421,5 +450,653 @@ func TestRunnerAfterAgentEndInvocation(t *testing.T) {
 	// Session should have user + e1 + end_ev = 3.
 	if sess.EventCount() != 3 {
 		t.Fatalf("expected 3 session events, got %d", sess.EventCount())
+	}
+}
+
+// =============================================================================
+// Chapter 02 — State lifecycle integration tests
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// Test 10: runner config with memory and artifact services
+// ---------------------------------------------------------------------------
+
+func TestRunnerConfigWithMemoryAndArtifact(t *testing.T) {
+	memSvc := memory.InMemoryService()
+	artSvc := artifact.InMemoryService()
+
+	r := newTestRunnerWithServices(t, "agent", memSvc, artSvc, model.TextResponse("ok"))
+	if r.memoryService == nil {
+		t.Error("expected memory service to be set")
+	}
+	if r.artifactService == nil {
+		t.Error("expected artifact service to be set")
+	}
+
+	// Services are optional — runner should still work without them.
+	r2, err := New(Config{
+		AppName:        "testapp",
+		Agent:          r.agent,
+		SessionService: NewInMemorySessionService(),
+	})
+	if err != nil {
+		t.Fatalf("runner without memory/artifact should be valid: %v", err)
+	}
+	if r2.memoryService != nil {
+		t.Error("expected nil memory service when not provided")
+	}
+	if r2.artifactService != nil {
+		t.Error("expected nil artifact service when not provided")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: scoped state mutation through event actions via runner
+// ---------------------------------------------------------------------------
+
+func TestRunnerScopedStateMutation(t *testing.T) {
+	stateTool := tool.NewFunctionTool("set_scoped_state", "Set scoped state",
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{
+				"status": "ok",
+				"state_delta": map[string]any{
+					"app:version":  "1.0",
+					"user:pref":    "dark",
+					"local":        "session_val",
+					"temp:scratch": "tmp_val",
+				},
+			}, nil
+		},
+	)
+
+	sessionSvc := NewInMemorySessionService()
+	fm := model.NewFakeModel("fake",
+		model.FunctionCallResponse("setting state",
+			event.FunctionCall{ID: "fc1", Name: "set_scoped_state", Args: map[string]any{}},
+		),
+		model.TextResponse("done"),
+	)
+	f := &flow.Flow{
+		Model: fm,
+		Tools: map[string]tool.FunctionTool{"set_scoped_state": stateTool},
+	}
+	ag, _ := llmagent.New("state_bot", "test", f)
+	ea := ag.(ExecutableAgent)
+	r, err := New(Config{
+		AppName:        "testapp",
+		Agent:          ea,
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sess, _, err := r.Run(stdctx.Background(), "user-1", "sess-scope", "Set state")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	// Session-local state check.
+	if v, ok := sess.State().Get("local"); !ok || v != "session_val" {
+		t.Errorf("local = %v, want 'session_val'", v)
+	}
+
+	// Temp state should NOT be in durable session state after Run.
+	if _, ok := sess.State().Get("temp:scratch"); ok {
+		t.Error("temp:scratch should be cleaned from durable session state after Run")
+	}
+
+	// Merged state should show app and user prefixes.
+	merged, err := sessionSvc.GetMergedState("testapp", "user-1", "sess-scope")
+	if err != nil {
+		t.Fatalf("GetMergedState: %v", err)
+	}
+	if merged["app:version"] != "1.0" {
+		t.Errorf("app:version = %v, want '1.0'", merged["app:version"])
+	}
+	if merged["user:pref"] != "dark" {
+		t.Errorf("user:pref = %v, want 'dark'", merged["user:pref"])
+	}
+	if merged["local"] != "session_val" {
+		t.Errorf("local = %v, want 'session_val'", merged["local"])
+	}
+
+	// Temp should NOT appear in merged state.
+	if _, ok := merged["temp:scratch"]; ok {
+		t.Error("temp:scratch should not appear in merged state (trimmed on persist)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: app and user state shared across sessions, session state isolated
+// ---------------------------------------------------------------------------
+
+func TestRunnerStateMergeAcrossSessions(t *testing.T) {
+	stateTool := tool.NewFunctionTool("set_scoped_state", "Set state",
+		func(args map[string]any) (map[string]any, error) {
+			delta, _ := args["delta"].(map[string]any)
+			return map[string]any{"status": "ok", "state_delta": delta}, nil
+		},
+	)
+
+	sessionSvc := NewInMemorySessionService()
+	buildRunner := func(agentName string, fcID string, delta map[string]any) *Runner {
+		fm := model.NewFakeModel("fake",
+			model.FunctionCallResponse("setting",
+				event.FunctionCall{ID: fcID, Name: "set_scoped_state", Args: map[string]any{"delta": delta}},
+			),
+			model.TextResponse("done"),
+		)
+		f := &flow.Flow{
+			Model: fm,
+			Tools: map[string]tool.FunctionTool{"set_scoped_state": stateTool},
+		}
+		ag, _ := llmagent.New(agentName, "test", f)
+		ea := ag.(ExecutableAgent)
+		r, _ := New(Config{
+			AppName:        "testapp",
+			Agent:          ea,
+			SessionService: sessionSvc,
+		})
+		return r
+	}
+
+	// Session 1 sets app and user state.
+	r1 := buildRunner("bot1", "fc1", map[string]any{
+		"app:theme": "corp",
+		"user:lang": "en",
+		"topic":     "from_sess1",
+	})
+	_, _, err := r1.Run(stdctx.Background(), "user-x", "sess-a", "msg")
+	if err != nil {
+		t.Fatalf("Run sess-a error: %v", err)
+	}
+
+	// Session 2 (same user) should see app and user state but not session state.
+	r2 := buildRunner("bot2", "fc2", map[string]any{
+		"user:font": "large",
+		"topic":     "from_sess2",
+	})
+	_, _, err = r2.Run(stdctx.Background(), "user-x", "sess-b", "msg")
+	if err != nil {
+		t.Fatalf("Run sess-b error: %v", err)
+	}
+
+	mergedB, _ := sessionSvc.GetMergedState("testapp", "user-x", "sess-b")
+	if mergedB["app:theme"] != "corp" {
+		t.Errorf("sess-b app:theme = %v, want 'corp'", mergedB["app:theme"])
+	}
+	if mergedB["user:lang"] != "en" {
+		t.Errorf("sess-b user:lang = %v, want 'en'", mergedB["user:lang"])
+	}
+	if mergedB["user:font"] != "large" {
+		t.Errorf("sess-b user:font = %v, want 'large'", mergedB["user:font"])
+	}
+	if mergedB["topic"] != "from_sess2" {
+		t.Errorf("sess-b topic = %v, want 'from_sess2' (session-local)", mergedB["topic"])
+	}
+
+	// sess-a should NOT have sess-b's session key.
+	mergedA, _ := sessionSvc.GetMergedState("testapp", "user-x", "sess-a")
+	if mergedA["topic"] != "from_sess1" {
+		t.Errorf("sess-a topic = %v, want 'from_sess1'", mergedA["topic"])
+	}
+	if _, ok := mergedA["user:font"]; !ok {
+		t.Error("sess-a should see user:font set by sess-b (user-scoped)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: temp state visible during invocation, not persisted
+// ---------------------------------------------------------------------------
+
+func TestRunnerTempStateLifecycle(t *testing.T) {
+	stateTool := tool.NewFunctionTool("set_temp", "Set temp state",
+		func(args map[string]any) (map[string]any, error) {
+			key, _ := args["key"].(string)
+			val, _ := args["value"].(string)
+			return map[string]any{
+				"state_delta": map[string]any{
+					"temp:" + key: val,
+					"durable":    "stays",
+				},
+			}, nil
+		},
+	)
+
+	sessionSvc := NewInMemorySessionService()
+	fm := model.NewFakeModel("fake",
+		model.FunctionCallResponse("setting temp",
+			event.FunctionCall{ID: "fc1", Name: "set_temp", Args: map[string]any{
+				"key": "cache", "value": "tmp-data",
+			}},
+		),
+		model.TextResponse("done"),
+	)
+	f := &flow.Flow{
+		Model: fm,
+		Tools: map[string]tool.FunctionTool{"set_temp": stateTool},
+	}
+	ag, _ := llmagent.New("temp_bot", "test", f)
+	ea := ag.(ExecutableAgent)
+	r, _ := New(Config{
+		AppName:        "testapp",
+		Agent:          ea,
+		SessionService: sessionSvc,
+	})
+
+	sess, _, err := r.Run(stdctx.Background(), "user-1", "sess-temp", "Go")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	// Temp key should NOT be in durable session state after Run returns.
+	if _, ok := sess.State().Get("temp:cache"); ok {
+		t.Error("temp:cache should be cleaned from durable session state after Run")
+	}
+
+	// Durable key visible.
+	if v, ok := sess.State().Get("durable"); !ok || v != "stays" {
+		t.Errorf("durable = %v, want 'stays'", v)
+	}
+
+	// Check persisted events — temp prefix removed from StateDelta.
+	for _, ev := range sess.Events() {
+		if _, ok := ev.Actions.StateDelta["temp:cache"]; ok {
+			t.Error("temp:cache should be trimmed from persisted event StateDelta")
+		}
+	}
+
+	// Merged state should NOT have temp prefix keys.
+	merged, _ := sessionSvc.GetMergedState("testapp", "user-1", "sess-temp")
+	if _, ok := merged["temp:cache"]; ok {
+		t.Error("temp:cache should not appear in merged state")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: artifact save and load alongside runner session
+// ---------------------------------------------------------------------------
+
+func TestRunnerArtifactSaveLoad(t *testing.T) {
+	artSvc := artifact.InMemoryService()
+
+	r := newTestRunnerWithServices(t, "art_bot", nil, artSvc,
+		model.TextResponse("I'll save an artifact for you."),
+	)
+
+	sess, _, err := r.Run(stdctx.Background(), "user-1", "sess-art", "Save my report")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if sess == nil {
+		t.Fatal("expected non-nil session")
+	}
+
+	// Save an artifact scoped to this session.
+	saveResp, err := artSvc.Save(t.Context(), &artifact.SaveRequest{
+		AppName:   "testapp",
+		UserID:    "user-1",
+		SessionID: sess.ID(),
+		FileName:  "output.txt",
+		Part:      &artifact.ArtifactPart{Text: "report content"},
+	})
+	if err != nil {
+		t.Fatalf("Save artifact: %v", err)
+	}
+	if saveResp.Version != 1 {
+		t.Errorf("first save version = %d, want 1", saveResp.Version)
+	}
+
+	// Save again — version increments.
+	saveResp2, _ := artSvc.Save(t.Context(), &artifact.SaveRequest{
+		AppName:   "testapp",
+		UserID:    "user-1",
+		SessionID: sess.ID(),
+		FileName:  "output.txt",
+		Part:      &artifact.ArtifactPart{Text: "updated report"},
+	})
+	if saveResp2.Version != 2 {
+		t.Errorf("second save version = %d, want 2", saveResp2.Version)
+	}
+
+	// Load latest.
+	loadResp, err := artSvc.Load(t.Context(), &artifact.LoadRequest{
+		AppName:   "testapp",
+		UserID:    "user-1",
+		SessionID: sess.ID(),
+		FileName:  "output.txt",
+	})
+	if err != nil {
+		t.Fatalf("Load artifact: %v", err)
+	}
+	if loadResp.Part.Text != "updated report" {
+		t.Errorf("latest = %q, want 'updated report'", loadResp.Part.Text)
+	}
+
+	// Load specific version.
+	loadV1, _ := artSvc.Load(t.Context(), &artifact.LoadRequest{
+		AppName:   "testapp",
+		UserID:    "user-1",
+		SessionID: sess.ID(),
+		FileName:  "output.txt",
+		Version:   1,
+	})
+	if loadV1.Part.Text != "report content" {
+		t.Errorf("version 1 = %q, want 'report content'", loadV1.Part.Text)
+	}
+
+	// Artifact scoped to session — not visible from another session.
+	_, err = artSvc.Load(t.Context(), &artifact.LoadRequest{
+		AppName:   "testapp",
+		UserID:    "user-1",
+		SessionID: "other-session",
+		FileName:  "output.txt",
+	})
+	if err == nil {
+		t.Error("artifact should not be visible from another session (session-scoped)")
+	}
+
+	// User-scoped artifact visible across sessions.
+	artSvc.Save(t.Context(), &artifact.SaveRequest{
+		AppName:   "testapp",
+		UserID:    "user-1",
+		SessionID: sess.ID(),
+		FileName:  "user:prefs.json",
+		Part:      &artifact.ArtifactPart{Text: `{"theme":"dark"}`},
+	})
+	userLoad, err := artSvc.Load(t.Context(), &artifact.LoadRequest{
+		AppName:   "testapp",
+		UserID:    "user-1",
+		SessionID: "other-session",
+		FileName:  "user:prefs.json",
+	})
+	if err != nil {
+		t.Fatalf("user-scoped artifact should be visible across sessions: %v", err)
+	}
+	if userLoad.Part.Text != `{"theme":"dark"}` {
+		t.Errorf("user-scoped content = %q", userLoad.Part.Text)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: memory add and search through runner
+// ---------------------------------------------------------------------------
+
+func TestRunnerMemoryAddSearch(t *testing.T) {
+	memSvc := memory.InMemoryService()
+
+	fm := model.NewFakeModel("fake",
+		model.TextResponse("The sky is blue and clouds are white."),
+		model.TextResponse("Tree leaves are green in spring."),
+	)
+
+	f := &flow.Flow{Model: fm}
+	ag, _ := llmagent.New("memory_bot", "test", f)
+	ea := ag.(ExecutableAgent)
+
+	sessionSvc := NewInMemorySessionService()
+	r, err := New(Config{
+		AppName:        "testapp",
+		Agent:          ea,
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Run a session with the runner.
+	sess1, _, err := r.Run(stdctx.Background(), "user-10", "sess-mem", "What do you remember?")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	// Run a second session for the same user.
+	sess2, _, err := r.Run(stdctx.Background(), "user-10", "sess-mem2", "Tell me more about my preferences")
+	if err != nil {
+		t.Fatalf("Run 2 error: %v", err)
+	}
+
+	// Add both sessions to memory.
+	if err := memSvc.AddSessionToMemory(t.Context(), sess1); err != nil {
+		t.Fatalf("AddSessionToMemory(sess1): %v", err)
+	}
+	if err := memSvc.AddSessionToMemory(t.Context(), sess2); err != nil {
+		t.Fatalf("AddSessionToMemory(sess2): %v", err)
+	}
+
+	// Search for "blue" — should find from sess1.
+	resp, err := memSvc.SearchMemory(t.Context(), &memory.SearchRequest{
+		AppName: "testapp",
+		UserID:  "user-10",
+		Query:   "blue",
+	})
+	if err != nil {
+		t.Fatalf("SearchMemory: %v", err)
+	}
+	if len(resp.Memories) != 1 {
+		t.Fatalf("expected 1 memory matching 'blue', got %d", len(resp.Memories))
+	}
+	if resp.Memories[0].Author != "memory_bot" {
+		t.Errorf("memory author = %q, want 'memory_bot'", resp.Memories[0].Author)
+	}
+
+	// Search for "green" — should find from sess2.
+	resp2, _ := memSvc.SearchMemory(t.Context(), &memory.SearchRequest{
+		AppName: "testapp",
+		UserID:  "user-10",
+		Query:   "green",
+	})
+	if len(resp2.Memories) != 1 {
+		t.Errorf("expected 1 memory matching 'green', got %d", len(resp2.Memories))
+	}
+
+	// Cross-user isolation — user-11 should not see user-10's memories.
+	resp3, _ := memSvc.SearchMemory(t.Context(), &memory.SearchRequest{
+		AppName: "testapp",
+		UserID:  "user-11",
+		Query:   "blue",
+	})
+	if len(resp3.Memories) != 0 {
+		t.Error("memory should be isolated by user")
+	}
+
+	// Cross-app isolation.
+	resp4, _ := memSvc.SearchMemory(t.Context(), &memory.SearchRequest{
+		AppName: "other-app",
+		UserID:  "user-10",
+		Query:   "blue",
+	})
+	if len(resp4.Memories) != 0 {
+		t.Error("memory should be isolated by app")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 16: full chain — runner + state scoping + artifact + memory
+// ---------------------------------------------------------------------------
+
+func TestRunnerFullChain(t *testing.T) {
+	artSvc := artifact.InMemoryService()
+	memSvc := memory.InMemoryService()
+
+	stateTool := tool.NewFunctionTool("set_pref", "Store user preference",
+		func(args map[string]any) (map[string]any, error) {
+			pref, _ := args["pref"].(string)
+			return map[string]any{
+				"status": "saved",
+				"state_delta": map[string]any{
+					"user:favorite_language": pref,
+					"session_step":           "pref_set",
+				},
+			}, nil
+		},
+	)
+
+	sessionSvc := NewInMemorySessionService()
+	buildRunner := func() *Runner {
+		fm := model.NewFakeModel("fake",
+			model.FunctionCallResponse("Saving preference.",
+				event.FunctionCall{
+					ID:   "fc1",
+					Name: "set_pref",
+					Args: map[string]any{"pref": "Go"},
+				},
+			),
+			model.TextResponse("Preference saved. Go is great!"),
+		)
+		f := &flow.Flow{
+			Model: fm,
+			Tools: map[string]tool.FunctionTool{"set_pref": stateTool},
+		}
+		ag, _ := llmagent.New("pref_bot", "test", f)
+		ea := ag.(ExecutableAgent)
+		r, _ := New(Config{
+			AppName:         "testapp",
+			Agent:           ea,
+			SessionService:  sessionSvc,
+			MemoryService:   memSvc,
+			ArtifactService: artSvc,
+		})
+		return r
+	}
+
+	r := buildRunner()
+
+	// 1. Run session → sets user: state via tool.
+	sess, _, err := r.Run(stdctx.Background(), "user-full", "sess-full", "I like Go")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	// 2. Verify state scoping.
+	merged, _ := sessionSvc.GetMergedState("testapp", "user-full", "sess-full")
+	if merged["user:favorite_language"] != "Go" {
+		t.Errorf("user:favorite_language = %v, want 'Go'", merged["user:favorite_language"])
+	}
+	if merged["session_step"] != "pref_set" {
+		t.Errorf("session_step = %v, want 'pref_set'", merged["session_step"])
+	}
+
+	// 3. Save artifact.
+	_, err = artSvc.Save(t.Context(), &artifact.SaveRequest{
+		AppName:   "testapp",
+		UserID:    "user-full",
+		SessionID: "sess-full",
+		FileName:  "summary.txt",
+		Part:      &artifact.ArtifactPart{Text: "User prefers Go"},
+	})
+	if err != nil {
+		t.Fatalf("Save artifact: %v", err)
+	}
+
+	// 4. Verify artifact.
+	loadResp, _ := artSvc.Load(t.Context(), &artifact.LoadRequest{
+		AppName:   "testapp",
+		UserID:    "user-full",
+		SessionID: "sess-full",
+		FileName:  "summary.txt",
+	})
+	if loadResp.Part.Text != "User prefers Go" {
+		t.Errorf("artifact content = %q, want 'User prefers Go'", loadResp.Part.Text)
+	}
+
+	// 5. Add to memory.
+	if err := memSvc.AddSessionToMemory(t.Context(), sess); err != nil {
+		t.Fatalf("AddSessionToMemory: %v", err)
+	}
+
+	// 6. Search memory — should find "Go" from the model response and tool args.
+	resp, _ := memSvc.SearchMemory(t.Context(), &memory.SearchRequest{
+		AppName: "testapp",
+		UserID:  "user-full",
+		Query:   "Go",
+	})
+	if len(resp.Memories) < 1 {
+		t.Error("expected at least 1 memory matching 'Go'")
+	}
+
+	// 7. A new session for the same user should see the user: state but NOT session state.
+	// Build a runner WITHOUT the state tool so it doesn't also set session_step.
+	fm2 := model.NewFakeModel("fake2", model.TextResponse("Hello! How can I help?"))
+	f2 := &flow.Flow{Model: fm2}
+	ag2, _ := llmagent.New("echo_bot", "test", f2)
+	ea2 := ag2.(ExecutableAgent)
+	r2, _ := New(Config{
+		AppName:         "testapp",
+		Agent:           ea2,
+		SessionService:  sessionSvc,
+		MemoryService:   memSvc,
+		ArtifactService: artSvc,
+	})
+	sess2, _, _ := r2.Run(stdctx.Background(), "user-full", "sess-full2", "Hello again")
+	if sess2 == nil {
+		t.Fatal("expected non-nil session")
+	}
+	merged2, _ := sessionSvc.GetMergedState("testapp", "user-full", "sess-full2")
+	if merged2["user:favorite_language"] != "Go" {
+		t.Errorf("new session user:favorite_language = %v, want 'Go'", merged2["user:favorite_language"])
+	}
+	// Session-scoped state should NOT leak.
+	if _, ok := merged2["session_step"]; ok {
+		t.Error("session_step should not leak across sessions")
+	}
+
+	// 8. New session events also go into memory — verify by searching for both sessions' content.
+	memSvc.AddSessionToMemory(t.Context(), sess2)
+	resp2, _ := memSvc.SearchMemory(t.Context(), &memory.SearchRequest{
+		AppName: "testapp",
+		UserID:  "user-full",
+		Query:   "how",
+	})
+	if len(resp2.Memories) < 1 {
+		t.Errorf("expected >= 1 memory from sess2 matching 'how', got %d", len(resp2.Memories))
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 17: artifact versions are independent from session events
+// ---------------------------------------------------------------------------
+
+func TestRunnerArtifactVersionIndependence(t *testing.T) {
+	artSvc := artifact.InMemoryService()
+
+	r := newTestRunnerWithServices(t, "bot", nil, artSvc,
+		model.TextResponse("first message"),
+		model.TextResponse("second message"),
+	)
+
+	// Run session — produces session events.
+	sess, _, err := r.Run(stdctx.Background(), "user-1", "sess-ver", "Msg 1")
+	if err != nil {
+		t.Fatalf("Run 1 error: %v", err)
+	}
+
+	// Run again on same session — more events.
+	sess2, _, err := r.Run(stdctx.Background(), "user-1", "sess-ver", "Msg 2")
+	if err != nil {
+		t.Fatalf("Run 2 error: %v", err)
+	}
+
+	// Artifact saves produce versions 1, 2, 3 — unrelated to event count.
+	artSvc.Save(t.Context(), &artifact.SaveRequest{
+		AppName: "testapp", UserID: "user-1", SessionID: sess.ID(),
+		FileName: "chart.png", Part: &artifact.ArtifactPart{InlineData: &artifact.InlineData{Data: []byte{1}, MIMEType: "image/png"}},
+	})
+	artSvc.Save(t.Context(), &artifact.SaveRequest{
+		AppName: "testapp", UserID: "user-1", SessionID: sess.ID(),
+		FileName: "chart.png", Part: &artifact.ArtifactPart{InlineData: &artifact.InlineData{Data: []byte{2}, MIMEType: "image/png"}},
+	})
+
+	versions, _ := artSvc.Versions(t.Context(), &artifact.VersionsRequest{
+		AppName: "testapp", UserID: "user-1", SessionID: sess.ID(), FileName: "chart.png",
+	})
+	if len(versions.Versions) != 2 || versions.Versions[0] != 1 || versions.Versions[1] != 2 {
+		t.Errorf("artifact versions = %v, want [1 2] (independent of event count)", versions.Versions)
+	}
+
+	// Session event count should be independent of artifact versions.
+	if sess2.EventCount() != 4 {
+		t.Errorf("event count = %d, want 4 (user1+model1+user2+model2)", sess2.EventCount())
 	}
 }

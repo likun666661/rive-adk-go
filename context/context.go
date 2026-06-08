@@ -16,6 +16,8 @@ import (
 	"sync"
 
 	"github.com/likun666661/rive-adk-go/agent"
+	"github.com/likun666661/rive-adk-go/artifact"
+	"github.com/likun666661/rive-adk-go/memory"
 	"github.com/likun666661/rive-adk-go/session"
 )
 
@@ -30,6 +32,9 @@ type InvocationContext interface {
 	Branch() string
 	UserContent() string
 
+	MemoryService() memory.Service
+	ArtifactService() artifact.Service
+
 	EndInvocation()
 	Ended() bool
 }
@@ -39,6 +44,8 @@ type Params struct {
 	Ctx          stdctx.Context
 	Agent        agent.Agent
 	Session      session.Session
+	Memory       memory.Service
+	Artifact     artifact.Service
 	InvocationID string
 	Branch       string
 	UserContent  string
@@ -50,33 +57,39 @@ func NewInvocationContext(p Params) InvocationContext {
 		p.Ctx = stdctx.Background()
 	}
 	return &invocationContext{
-		Context:      p.Ctx,
-		ag:           p.Agent,
-		session:      p.Session,
-		invocationID: p.InvocationID,
-		branch:       p.Branch,
-		userContent:  p.UserContent,
+		Context:         p.Ctx,
+		ag:              p.Agent,
+		session:         p.Session,
+		memoryService:   p.Memory,
+		artifactService: p.Artifact,
+		invocationID:    p.InvocationID,
+		branch:          p.Branch,
+		userContent:     p.UserContent,
 	}
 }
 
 type invocationContext struct {
 	stdctx.Context
 
-	ag           agent.Agent
-	session      session.Session
-	invocationID string
-	branch       string
-	userContent  string
+	ag              agent.Agent
+	session         session.Session
+	memoryService   memory.Service
+	artifactService artifact.Service
+	invocationID    string
+	branch          string
+	userContent     string
 
 	mu    sync.RWMutex
 	ended bool
 }
 
-func (c *invocationContext) Agent() agent.Agent     { return c.ag }
-func (c *invocationContext) Session() session.Session { return c.session }
-func (c *invocationContext) InvocationID() string     { return c.invocationID }
-func (c *invocationContext) Branch() string           { return c.branch }
-func (c *invocationContext) UserContent() string      { return c.userContent }
+func (c *invocationContext) Agent() agent.Agent              { return c.ag }
+func (c *invocationContext) Session() session.Session          { return c.session }
+func (c *invocationContext) MemoryService() memory.Service     { return c.memoryService }
+func (c *invocationContext) ArtifactService() artifact.Service { return c.artifactService }
+func (c *invocationContext) InvocationID() string              { return c.invocationID }
+func (c *invocationContext) Branch() string                    { return c.branch }
+func (c *invocationContext) UserContent() string               { return c.userContent }
 
 func (c *invocationContext) EndInvocation() {
 	c.mu.Lock()

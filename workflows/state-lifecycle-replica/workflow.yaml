@@ -1,0 +1,150 @@
+api_version: rive.workflow/v0
+id: rive-adk-go.state-lifecycle-replica
+version: 1
+title: Rive ADK Go state lifecycle replica
+params:
+  repo_path:
+    type: string
+    required: true
+  chapter_path:
+    type: string
+    required: true
+  source_repo:
+    type: string
+    required: true
+nodes:
+  extend-session-state-scopes:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-a
+    acceptance_mode: auto-reported
+    title: Extend session state scope semantics
+    prompt:
+      file: prompts/01-extend-session-state-scopes.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  add-memory-artifact-services:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-b
+    acceptance_mode: auto-reported
+    title: Add memory and artifact services
+    consumes:
+      - extend-session-state-scopes
+    prompt:
+      file: prompts/02-add-memory-artifact-services.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  integrate-state-lifecycle-demo:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-c
+    acceptance_mode: auto-reported
+    title: Integrate state lifecycle into runner and docs
+    consumes:
+      - extend-session-state-scopes
+      - add-memory-artifact-services
+    prompt:
+      file: prompts/03-integrate-state-lifecycle-demo.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  codex-review-state-lifecycle:
+    kind: review
+    runner: codex
+    worker: codex-runtime-steward
+    acceptance_mode: auto-reported
+    title: Codex review and acceptance notes
+    consumes:
+      - extend-session-state-scopes
+      - add-memory-artifact-services
+      - integrate-state-lifecycle-demo
+    prompt:
+      file: prompts/04-codex-review-state-lifecycle.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - review_findings
+        - required_fixes
+        - verification
+        - merge_guidance
+  opencode-final-merge-state-lifecycle:
+    kind: review
+    runner: opencode
+    worker: opencode-runtime-c
+    acceptance_mode: auto-reported
+    title: OpenCode final fixes, verification, and commit
+    consumes:
+      - extend-session-state-scopes
+      - add-memory-artifact-services
+      - integrate-state-lifecycle-demo
+      - codex-review-state-lifecycle
+    prompt:
+      file: prompts/05-opencode-final-merge-state-lifecycle.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - review_response
+        - fixes
+        - verification
+        - commit
+edges:
+  - type: decomposes_to
+    from: root
+    to: extend-session-state-scopes
+  - type: decomposes_to
+    from: root
+    to: add-memory-artifact-services
+  - type: decomposes_to
+    from: root
+    to: integrate-state-lifecycle-demo
+  - type: decomposes_to
+    from: root
+    to: codex-review-state-lifecycle
+  - type: decomposes_to
+    from: root
+    to: opencode-final-merge-state-lifecycle
+  - type: depends_on
+    from: add-memory-artifact-services
+    to: extend-session-state-scopes
+  - type: depends_on
+    from: integrate-state-lifecycle-demo
+    to: extend-session-state-scopes
+  - type: depends_on
+    from: integrate-state-lifecycle-demo
+    to: add-memory-artifact-services
+  - type: depends_on
+    from: codex-review-state-lifecycle
+    to: extend-session-state-scopes
+  - type: depends_on
+    from: codex-review-state-lifecycle
+    to: add-memory-artifact-services
+  - type: depends_on
+    from: codex-review-state-lifecycle
+    to: integrate-state-lifecycle-demo
+  - type: depends_on
+    from: opencode-final-merge-state-lifecycle
+    to: extend-session-state-scopes
+  - type: depends_on
+    from: opencode-final-merge-state-lifecycle
+    to: add-memory-artifact-services
+  - type: depends_on
+    from: opencode-final-merge-state-lifecycle
+    to: integrate-state-lifecycle-demo
+  - type: depends_on
+    from: opencode-final-merge-state-lifecycle
+    to: codex-review-state-lifecycle

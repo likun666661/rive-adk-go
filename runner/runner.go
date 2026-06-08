@@ -18,11 +18,12 @@ import (
 	stdctx "context"
 	stderrors "errors"
 	"fmt"
-	"sync"
 
 	"github.com/likun666661/rive-adk-go/agent"
+	"github.com/likun666661/rive-adk-go/artifact"
 	invctx "github.com/likun666661/rive-adk-go/context"
 	"github.com/likun666661/rive-adk-go/event"
+	"github.com/likun666661/rive-adk-go/memory"
 	"github.com/likun666661/rive-adk-go/session"
 )
 
@@ -38,57 +39,47 @@ type SessionService interface {
 	Create(ctx stdctx.Context, appName, userID, sessionID string) (session.Session, error)
 }
 
-// InMemorySessionService is a simple in-memory session store.
+// InMemorySessionService is a scope-aware session store backed by session.Service.
 type InMemorySessionService struct {
-	mu       sync.RWMutex
-	sessions map[string]session.Session
+	svc *session.Service
 }
 
-// NewInMemorySessionService creates a new InMemorySessionService.
+// NewInMemorySessionService creates a new scope-aware InMemorySessionService.
 func NewInMemorySessionService() *InMemorySessionService {
 	return &InMemorySessionService{
-		sessions: make(map[string]session.Session),
+		svc: session.NewService(),
 	}
-}
-
-func (s *InMemorySessionService) key(appName, userID, sessionID string) string {
-	return appName + "/" + userID + "/" + sessionID
 }
 
 func (s *InMemorySessionService) Get(ctx stdctx.Context, appName, userID, sessionID string) (session.Session, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	sess, ok := s.sessions[s.key(appName, userID, sessionID)]
-	if !ok {
-		return nil, fmt.Errorf("runner: session %q not found", sessionID)
-	}
-	return sess, nil
+	return s.svc.Get(appName, userID, sessionID)
 }
 
 func (s *InMemorySessionService) Create(ctx stdctx.Context, appName, userID, sessionID string) (session.Session, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	key := s.key(appName, userID, sessionID)
-	if existing, ok := s.sessions[key]; ok {
-		return existing, nil
-	}
-	sess := session.NewInMemorySession(sessionID, appName, userID)
-	s.sessions[key] = sess
-	return sess, nil
+	return s.svc.GetOrCreate(appName, userID, sessionID)
+}
+
+// GetMergedState returns the fully merged app+user+session state for a session.
+func (s *InMemorySessionService) GetMergedState(appName, userID, sessionID string) (map[string]any, error) {
+	return s.svc.GetMergedState(appName, userID, sessionID)
 }
 
 // Runner orchestrates the Agent → Flow → Event → Session chain.
 type Runner struct {
-	appName        string
-	agent          ExecutableAgent
-	sessionService SessionService
+	appName         string
+	agent           ExecutableAgent
+	sessionService  SessionService
+	memoryService   memory.Service
+	artifactService artifact.Service
 }
 
 // Config holds configuration for creating a new Runner.
 type Config struct {
-	AppName        string
-	Agent          ExecutableAgent
-	SessionService SessionService
+	AppName         string
+	Agent           ExecutableAgent
+	SessionService  SessionService
+	MemoryService   memory.Service
+	ArtifactService artifact.Service
 }
 
 // New creates a new Runner.
@@ -103,9 +94,11 @@ func New(cfg Config) (*Runner, error) {
 		return nil, fmt.Errorf("runner: SessionService is required")
 	}
 	return &Runner{
-		appName:        cfg.AppName,
-		agent:          cfg.Agent,
-		sessionService: cfg.SessionService,
+		appName:         cfg.AppName,
+		agent:           cfg.Agent,
+		sessionService:  cfg.SessionService,
+		memoryService:   cfg.MemoryService,
+		artifactService: cfg.ArtifactService,
 	}, nil
 }
 
@@ -151,6 +144,8 @@ func (r *Runner) Run(ctx stdctx.Context, userID, sessionID, message string) (ses
 		Ctx:          ctx,
 		Agent:        r.agent,
 		Session:      sess,
+		Memory:       r.memoryService,
+		Artifact:     r.artifactService,
 		InvocationID: invocationID,
 		Branch:       r.agent.Name(),
 		UserContent:  message,
