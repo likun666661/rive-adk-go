@@ -1,0 +1,5 @@
+.rive/
+.opencode/
+*.test
+coverage.out
+

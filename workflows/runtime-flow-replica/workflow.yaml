@@ -1,0 +1,110 @@
+api_version: rive.workflow/v0
+id: rive-adk-go.runtime-flow-replica
+version: 1
+title: Rive ADK Go runtime-flow replica
+params:
+  repo_path:
+    type: string
+    required: true
+  chapter_path:
+    type: string
+    required: true
+  source_repo:
+    type: string
+    required: true
+nodes:
+  scaffold-runtime-contracts:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-a
+    acceptance_mode: auto-reported
+    title: Scaffold runtime contracts and core types
+    prompt:
+      file: prompts/01-scaffold-runtime-contracts.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  implement-flow-model-tool:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-b
+    acceptance_mode: auto-reported
+    title: Implement Flow, Model, Tool loop
+    consumes: [scaffold-runtime-contracts]
+    prompt:
+      file: prompts/02-implement-flow-model-tool.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  implement-runner-examples:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-c
+    acceptance_mode: auto-reported
+    title: Implement Runner, examples, integration tests
+    consumes: [implement-flow-model-tool]
+    prompt:
+      file: prompts/03-implement-runner-examples.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  codex-review-merge:
+    kind: review
+    runner: codex
+    worker: codex-runtime-steward
+    acceptance_mode: auto-reported
+    title: Codex final review, fixes, verification, commit
+    consumes:
+      - scaffold-runtime-contracts
+      - implement-flow-model-tool
+      - implement-runner-examples
+    prompt:
+      file: prompts/04-codex-review-merge.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - review_findings
+        - fixes
+        - verification
+        - commit
+edges:
+  - type: decomposes_to
+    from: root
+    to: scaffold-runtime-contracts
+  - type: decomposes_to
+    from: root
+    to: implement-flow-model-tool
+  - type: decomposes_to
+    from: root
+    to: implement-runner-examples
+  - type: decomposes_to
+    from: root
+    to: codex-review-merge
+  - type: depends_on
+    from: implement-flow-model-tool
+    to: scaffold-runtime-contracts
+  - type: depends_on
+    from: implement-runner-examples
+    to: implement-flow-model-tool
+  - type: depends_on
+    from: codex-review-merge
+    to: scaffold-runtime-contracts
+  - type: depends_on
+    from: codex-review-merge
+    to: implement-flow-model-tool
+  - type: depends_on
+    from: codex-review-merge
+    to: implement-runner-examples
+
