@@ -1,0 +1,733 @@
+package flow
+
+import (
+	"errors"
+	"fmt"
+	"sync"
+	"testing"
+
+	"github.com/likun666661/rive-adk-go/context"
+	"github.com/likun666661/rive-adk-go/event"
+	"github.com/likun666661/rive-adk-go/model"
+	"github.com/likun666661/rive-adk-go/session"
+	"github.com/likun666661/rive-adk-go/tool"
+)
+
+// ---------------------------------------------------------------------------
+// test helpers
+// ---------------------------------------------------------------------------
+
+type testAgent struct{ name, desc string }
+
+func (a *testAgent) Name() string        { return a.name }
+func (a *testAgent) Description() string { return a.desc }
+
+func newTestCtx(name string) context.InvocationContext {
+	a := &testAgent{name: name, desc: "test agent"}
+	s := session.NewInMemorySession("sid-1", "app", "user1")
+	return context.NewInvocationContext(context.Params{
+		Agent:        a,
+		Session:      s,
+		InvocationID: "inv-1",
+		Branch:       "test_agent",
+		UserContent:  "hello",
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Test 1: final model response (text‑only, single step)
+// ---------------------------------------------------------------------------
+
+func TestFlowFinalModelResponse(t *testing.T) {
+	ctx := newTestCtx("test_agent")
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			model.TextResponse("The weather is sunny with 22°C."),
+		),
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	ev := events[0]
+	if !ev.IsFinalResponse() {
+		t.Error("text-only event should be final")
+	}
+	if ev.Content == nil || len(ev.Content.Parts) == 0 {
+		t.Fatal("expected content with parts")
+	}
+	if ev.Content.Parts[0].Text != "The weather is sunny with 22°C." {
+		t.Errorf("text = %q", ev.Content.Parts[0].Text)
+	}
+	if ev.Author != "test_agent" {
+		t.Errorf("author = %q, want 'test_agent'", ev.Author)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 2: one tool call followed by final response
+// ---------------------------------------------------------------------------
+
+func TestFlowOneToolCallThenFinalResponse(t *testing.T) {
+	ctx := newTestCtx("weather_agent")
+
+	weatherTool := tool.NewFunctionTool("get_weather", "Get weather for a city",
+		func(args map[string]any) (map[string]any, error) {
+			city, _ := args["city"].(string)
+			return map[string]any{
+				"city":        city,
+				"temperature": 22,
+				"condition":   "sunny",
+			}, nil
+		},
+	)
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			// Step 1: model returns a function call
+			model.FunctionCallResponse("Let me check the weather.",
+				event.FunctionCall{ID: "fc1", Name: "get_weather", Args: map[string]any{"city": "Tokyo"}},
+			),
+			// Step 2: model returns final text response
+			model.TextResponse("The weather in Tokyo is 22°C and sunny."),
+		),
+		Tools: map[string]tool.FunctionTool{
+			"get_weather": weatherTool,
+		},
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	// Expect: [model event with fc, tool result event, final model event]
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+
+	// Event 1: model response with function call
+	ev1 := events[0]
+	if !ev1.HasFunctionCalls() {
+		t.Error("event 1 should have function calls")
+	}
+	if ev1.IsFinalResponse() {
+		t.Error("event 1 (with function call) should NOT be final")
+	}
+
+	// Event 2: tool result
+	ev2 := events[1]
+	if ev2.Role != event.RoleTool {
+		t.Errorf("event 2 role = %q, want 'tool'", ev2.Role)
+	}
+	if ev2.Content == nil || len(ev2.Content.Parts) == 0 {
+		t.Fatal("tool event should have content")
+	}
+	fr := ev2.Content.Parts[0].FunctionResponse
+	if fr == nil {
+		t.Fatal("tool event should have function response")
+	}
+	if fr.Name != "get_weather" {
+		t.Errorf("tool name = %q, want 'get_weather'", fr.Name)
+	}
+	if fr.Error != "" {
+		t.Errorf("tool error = %q, want empty", fr.Error)
+	}
+	temp, _ := fr.Result["temperature"].(int)
+	if temp != 22 {
+		t.Errorf("temperature = %d, want 22", temp)
+	}
+
+	// Event 3: final model response
+	ev3 := events[2]
+	if !ev3.IsFinalResponse() {
+		t.Error("event 3 should be final")
+	}
+	if ev3.Content.Parts[0].Text != "The weather in Tokyo is 22°C and sunny." {
+		t.Errorf("final text = %q", ev3.Content.Parts[0].Text)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 3: multiple tool calls executing in parallel with deterministic merge
+// ---------------------------------------------------------------------------
+
+func TestFlowMultipleToolCallsDeterministic(t *testing.T) {
+	ctx := newTestCtx("multi_agent")
+
+	// Use a mutex to track execution order — tools should execute.
+	var mu sync.Mutex
+	var callOrder []string
+
+	weatherTool := tool.NewFunctionTool("get_weather", "Get weather",
+		func(args map[string]any) (map[string]any, error) {
+			mu.Lock()
+			callOrder = append(callOrder, "get_weather")
+			mu.Unlock()
+			return map[string]any{"condition": "sunny"}, nil
+		},
+	)
+	searchTool := tool.NewFunctionTool("search", "Search web",
+		func(args map[string]any) (map[string]any, error) {
+			mu.Lock()
+			callOrder = append(callOrder, "search")
+			mu.Unlock()
+			return map[string]any{"results": []string{"link1", "link2"}}, nil
+		},
+	)
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			model.FunctionCallResponse("Let me look into that.",
+				event.FunctionCall{ID: "fc-w", Name: "get_weather", Args: map[string]any{"city": "Tokyo"}},
+				event.FunctionCall{ID: "fc-s", Name: "search", Args: map[string]any{"q": "weather Tokyo"}},
+			),
+			model.TextResponse("Both tools completed successfully."),
+		),
+		Tools: map[string]tool.FunctionTool{
+			"get_weather": weatherTool,
+			"search":      searchTool,
+		},
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if len(callOrder) != 2 {
+		t.Errorf("expected 2 tool calls, got %d: %v", len(callOrder), callOrder)
+	}
+
+	// Expect: [model event with 2 fcs, tool result event, final model event]
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+
+	// The tool result event should have 2 function responses.
+	ev2 := events[1]
+	if ev2.Role != event.RoleTool {
+		t.Errorf("event 2 role = %q, want 'tool'", ev2.Role)
+	}
+	if ev2.Content == nil {
+		t.Fatal("tool event should have content")
+	}
+	if len(ev2.Content.Parts) != 2 {
+		t.Fatalf("expected 2 function response parts, got %d", len(ev2.Content.Parts))
+	}
+
+	// Collect names from responses
+	names := make(map[string]bool)
+	for _, p := range ev2.Content.Parts {
+		if p.FunctionResponse != nil {
+			names[p.FunctionResponse.Name] = true
+		}
+	}
+	if !names["get_weather"] || !names["search"] {
+		t.Errorf("missing expected tool names in responses: %v", names)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 4: state delta merge from tool results
+// ---------------------------------------------------------------------------
+
+func TestFlowStateDeltaMerge(t *testing.T) {
+	ctx := newTestCtx("state_agent")
+
+	stateTool := tool.NewFunctionTool("update_state", "Update session state",
+		func(args map[string]any) (map[string]any, error) {
+			key, _ := args["key"].(string)
+			return map[string]any{
+				"status":      "ok",
+				"state_delta": map[string]any{key: args["value"]},
+			}, nil
+		},
+	)
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			model.FunctionCallResponse("Updating state...",
+				event.FunctionCall{ID: "fc1", Name: "update_state", Args: map[string]any{"key": "weather.last", "value": "sunny"}},
+			),
+			model.TextResponse("State updated."),
+		),
+		Tools: map[string]tool.FunctionTool{
+			"update_state": stateTool,
+		},
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+
+	// Verify session state was updated.
+	v, ok := ctx.Session().State().Get("weather.last")
+	if !ok {
+		t.Error("expected 'weather.last' in session state")
+	}
+	if v != "sunny" {
+		t.Errorf("weather.last = %v, want 'sunny'", v)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 5: processor / callback ordering
+// ---------------------------------------------------------------------------
+
+func TestFlowProcessorCallbackOrdering(t *testing.T) {
+	ctx := newTestCtx("order_agent")
+
+	var steps []string
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			model.TextResponse("All done."),
+		),
+		RequestProcessors: []RequestProcessor{
+			func(ctx context.InvocationContext, req *model.LLMRequest) (*event.Event, error) {
+				steps = append(steps, "reqProcessor1")
+				return nil, nil
+			},
+			func(ctx context.InvocationContext, req *model.LLMRequest) (*event.Event, error) {
+				steps = append(steps, "reqProcessor2")
+				return nil, nil
+			},
+		},
+		BeforeModelCallbacks: []BeforeModelCallback{
+			func(ctx context.InvocationContext, req *model.LLMRequest) (*model.LLMResponse, error) {
+				steps = append(steps, "beforeModel")
+				return nil, nil
+			},
+		},
+		AfterModelCallbacks: []AfterModelCallback{
+			func(ctx context.InvocationContext, req *model.LLMRequest, resp *model.LLMResponse, callErr error) (*model.LLMResponse, error) {
+				steps = append(steps, "afterModel")
+				return nil, nil
+			},
+		},
+		ResponseProcessors: []ResponseProcessor{
+			func(ctx context.InvocationContext, req *model.LLMRequest, resp *model.LLMResponse) error {
+				steps = append(steps, "respProcessor")
+				return nil
+			},
+		},
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+
+	// Expected ordering: reqProcessor1 → reqProcessor2 → beforeModel → afterModel → respProcessor
+	expected := []string{
+		"reqProcessor1", "reqProcessor2",
+		"beforeModel", "afterModel",
+		"respProcessor",
+	}
+	if len(steps) != len(expected) {
+		t.Fatalf("expected %d steps, got %d: %v", len(expected), len(steps), steps)
+	}
+	for i, want := range expected {
+		if steps[i] != want {
+			t.Errorf("step[%d] = %q, want %q", i, steps[i], want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 6: tool error becomes an event/error result (not silent success)
+// ---------------------------------------------------------------------------
+
+func TestFlowToolErrorBecomesEvent(t *testing.T) {
+	ctx := newTestCtx("error_agent")
+
+	failingTool := tool.NewFunctionTool("unreliable", "Always fails",
+		func(args map[string]any) (map[string]any, error) {
+			return nil, errors.New("database connection refused")
+		},
+	)
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			model.FunctionCallResponse("I will try to query.",
+				event.FunctionCall{ID: "fc1", Name: "unreliable", Args: map[string]any{"query": "SELECT 1"}},
+			),
+			model.TextResponse("Sorry, the operation failed."),
+		),
+		Tools: map[string]tool.FunctionTool{
+			"unreliable": failingTool,
+		},
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+
+	// Event 2: tool result with error
+	ev2 := events[1]
+	if ev2.Role != event.RoleTool {
+		t.Errorf("event 2 role = %q, want 'tool'", ev2.Role)
+	}
+	if ev2.ErrorMessage == "" {
+		t.Error("tool error event should have ErrorMessage set")
+	}
+	fr := ev2.Content.Parts[0].FunctionResponse
+	if fr == nil {
+		t.Fatal("expected function response")
+	}
+	if fr.Error == "" {
+		t.Error("function response should have non-empty Error field")
+	}
+	if fr.Result == nil {
+		t.Fatal("function response should have Result map")
+	}
+	if errStr, ok := fr.Result["error"].(string); !ok || errStr != "database connection refused" {
+		t.Errorf("result[error] = %v", fr.Result["error"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 7: request processor short-circuit
+// ---------------------------------------------------------------------------
+
+func TestFlowRequestProcessorShortCircuit(t *testing.T) {
+	ctx := newTestCtx("short_agent")
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			model.TextResponse("This should never be called."),
+		),
+		RequestProcessors: []RequestProcessor{
+			func(ctx context.InvocationContext, req *model.LLMRequest) (*event.Event, error) {
+				return &event.Event{
+					ID:      "early",
+					Content: &event.Content{Role: event.RoleModel, Parts: []event.Part{{Text: "early exit"}}},
+				}, nil
+			},
+		},
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event (early exit), got %d", len(events))
+	}
+	if events[0].ID != "early" {
+		t.Errorf("event ID = %q, want 'early'", events[0].ID)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 8: before model callback short-circuit
+// ---------------------------------------------------------------------------
+
+func TestFlowBeforeModelCallbackShortCircuit(t *testing.T) {
+	ctx := newTestCtx("short_model_agent")
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			model.TextResponse("This should never be called."),
+		),
+		BeforeModelCallbacks: []BeforeModelCallback{
+			func(ctx context.InvocationContext, req *model.LLMRequest) (*model.LLMResponse, error) {
+				return model.TextResponse("From before callback."), nil
+			},
+		},
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Content.Parts[0].Text != "From before callback." {
+		t.Errorf("text = %q", events[0].Content.Parts[0].Text)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 9: before tool callback overrides tool result
+// ---------------------------------------------------------------------------
+
+func TestFlowBeforeToolCallbackOverride(t *testing.T) {
+	ctx := newTestCtx("override_agent")
+
+	weatherTool := tool.NewFunctionTool("get_weather", "Get weather",
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"real": true}, nil
+		},
+	)
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			model.FunctionCallResponse("Checking weather...",
+				event.FunctionCall{ID: "fc1", Name: "get_weather", Args: map[string]any{"city": "Paris"}},
+			),
+			model.TextResponse("Weather checked."),
+		),
+		Tools: map[string]tool.FunctionTool{
+			"get_weather": weatherTool,
+		},
+		BeforeToolCallbacks: []BeforeToolCallback{
+			func(ctx context.InvocationContext, toolName string, args map[string]any) (map[string]any, error) {
+				return map[string]any{"cached": true, "temperature": 18}, nil
+			},
+		},
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	// Tool event should have cached result.
+	ev2 := events[1]
+	fr := ev2.Content.Parts[0].FunctionResponse
+	cached, _ := fr.Result["cached"].(bool)
+	if !cached {
+		t.Error("expected cached result from before tool callback override")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 10: after tool callback transforms result
+// ---------------------------------------------------------------------------
+
+func TestFlowAfterToolCallbackTransform(t *testing.T) {
+	ctx := newTestCtx("transform_agent")
+
+	weatherTool := tool.NewFunctionTool("get_weather", "Get weather",
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"temp_c": 22}, nil
+		},
+	)
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			model.FunctionCallResponse("Checking weather...",
+				event.FunctionCall{ID: "fc1", Name: "get_weather", Args: map[string]any{"city": "Berlin"}},
+			),
+			model.TextResponse("Done."),
+		),
+		Tools: map[string]tool.FunctionTool{
+			"get_weather": weatherTool,
+		},
+		AfterToolCallbacks: []AfterToolCallback{
+			func(ctx context.InvocationContext, toolName string, args, result map[string]any, runErr error) (map[string]any, error) {
+				tempC, ok := result["temp_c"].(int)
+				if !ok {
+					return result, nil
+				}
+				return map[string]any{
+					"temp_c": tempC,
+					"temp_f": tempC*9/5 + 32,
+				}, nil
+			},
+		},
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	ev2 := events[1]
+	fr := ev2.Content.Parts[0].FunctionResponse
+	tempF, ok := fr.Result["temp_f"].(int)
+	if !ok || tempF != 71 {
+		t.Errorf("temp_f = %v, want 71", fr.Result["temp_f"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 11: no model configured returns error
+// ---------------------------------------------------------------------------
+
+func TestFlowNoModelReturnsError(t *testing.T) {
+	ctx := newTestCtx("no_model_agent")
+	f := &Flow{}
+	_, err := f.Run(ctx)
+	if err == nil {
+		t.Error("expected error for missing model")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 12: multiple steps with tool loop then final
+// ---------------------------------------------------------------------------
+
+func TestFlowMultiToolMultiStep(t *testing.T) {
+	ctx := newTestCtx("multi_step_agent")
+
+	queryTool := tool.NewFunctionTool("query_db", "Query a database",
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"rows": 42}, nil
+		},
+	)
+	formatTool := tool.NewFunctionTool("format_result", "Format a result",
+		func(args map[string]any) (map[string]any, error) {
+			val, _ := args["value"]
+			return map[string]any{"formatted": fmt.Sprintf("Result: %v", val)}, nil
+		},
+	)
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			// Step 1: call query_db
+			model.FunctionCallResponse("Let me query.",
+				event.FunctionCall{ID: "fc1", Name: "query_db", Args: map[string]any{"sql": "SELECT count(*)"}},
+			),
+			// Step 2: after getting query result, call format_result
+			model.FunctionCallResponse("Now let me format.",
+				event.FunctionCall{ID: "fc2", Name: "format_result", Args: map[string]any{"value": 42}},
+			),
+			// Step 3: final text
+			model.TextResponse("The query returned: Result: 42"),
+		),
+		Tools: map[string]tool.FunctionTool{
+			"query_db":      queryTool,
+			"format_result": formatTool,
+		},
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	// Expect: model(fc query) → tool(query result) → model(fc format) → tool(format result) → model(final)
+	if len(events) != 5 {
+		t.Fatalf("expected 5 events, got %d", len(events))
+	}
+
+	// Verify final event is final
+	lastEv := events[len(events)-1]
+	if !lastEv.IsFinalResponse() {
+		t.Error("last event should be final")
+	}
+
+	// Count tool events
+	toolCount := 0
+	for _, ev := range events {
+		if ev.Role == event.RoleTool {
+			toolCount++
+		}
+	}
+	if toolCount != 2 {
+		t.Errorf("expected 2 tool events, got %d", toolCount)
+	}
+
+	seenIDs := make(map[string]bool)
+	for _, ev := range events {
+		if seenIDs[ev.ID] {
+			t.Fatalf("duplicate event ID %q in multi-step flow", ev.ID)
+		}
+		seenIDs[ev.ID] = true
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 13: tool not found creates error result
+// ---------------------------------------------------------------------------
+
+func TestFlowToolNotFound(t *testing.T) {
+	ctx := newTestCtx("missing_tool_agent")
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			model.FunctionCallResponse("Calling unknown tool.",
+				event.FunctionCall{ID: "fc1", Name: "nonexistent", Args: map[string]any{}},
+			),
+			model.TextResponse("Fallback response."),
+		),
+		Tools: map[string]tool.FunctionTool{},
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// Tool result event should carry error
+	ev2 := events[1]
+	if ev2.Role != event.RoleTool {
+		t.Errorf("event 2 role = %q, want 'tool'", ev2.Role)
+	}
+	if ev2.ErrorMessage == "" {
+		t.Error("tool-not-found should populate ErrorMessage")
+	}
+	fr := ev2.Content.Parts[0].FunctionResponse
+	if fr.Error == "" {
+		t.Error("function response should have error for missing tool")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 14: empty response with no content and no error is skipped
+// ---------------------------------------------------------------------------
+
+func TestFlowEmptyResponseSkipped(t *testing.T) {
+	ctx := newTestCtx("empty_agent")
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			// First response: empty (no content, no error code) — should skip
+			&model.LLMResponse{},
+			// Second response: final text
+			model.TextResponse("After empty skip."),
+		),
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event (empty skipped), got %d", len(events))
+	}
+	if events[0].Content.Parts[0].Text != "After empty skip." {
+		t.Errorf("text = %q", events[0].Content.Parts[0].Text)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 15: nil model response fails cleanly
+// ---------------------------------------------------------------------------
+
+type nilResponseModel struct{}
+
+func (nilResponseModel) Name() string { return "nil-model" }
+
+func (nilResponseModel) GenerateContent(req *model.LLMRequest) (*model.LLMResponse, error) {
+	return nil, nil
+}
+
+func TestFlowNilModelResponseReturnsError(t *testing.T) {
+	ctx := newTestCtx("nil_agent")
+	f := &Flow{Model: nilResponseModel{}}
+
+	_, err := f.Run(ctx)
+	if err == nil {
+		t.Fatal("expected error for nil model response")
+	}
+	if got := err.Error(); got != `flow: model "nil-model" returned nil response` {
+		t.Fatalf("error = %q", got)
+	}
+}
