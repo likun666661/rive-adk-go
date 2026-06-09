@@ -1,0 +1,150 @@
+api_version: rive.workflow/v0
+id: rive-adk-go.entrypoint-deploy-replica
+version: 1
+title: Rive ADK Go entrypoint deploy telemetry replica
+params:
+  repo_path:
+    type: string
+    required: true
+  chapter_path:
+    type: string
+    required: true
+  source_repo:
+    type: string
+    required: true
+nodes:
+  implement-launcher-cli:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-a
+    acceptance_mode: auto-reported
+    title: Implement launcher config, CLI, and sublauncher routing
+    prompt:
+      file: prompts/01-implement-launcher-cli.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  implement-rest-server:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-b
+    acceptance_mode: auto-reported
+    title: Implement REST and SSE server entrypoint
+    consumes:
+      - implement-launcher-cli
+    prompt:
+      file: prompts/02-implement-rest-server.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  implement-deploy-telemetry:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-c
+    acceptance_mode: auto-reported
+    title: Implement deploy plan and telemetry instrumentation model
+    consumes:
+      - implement-launcher-cli
+      - implement-rest-server
+    prompt:
+      file: prompts/03-implement-deploy-telemetry.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  integrate-entrypoint-demo-docs:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-a
+    acceptance_mode: auto-reported
+    title: Integrate entrypoint demo, docs, and tests
+    consumes:
+      - implement-launcher-cli
+      - implement-rest-server
+      - implement-deploy-telemetry
+    prompt:
+      file: prompts/04-integrate-entrypoint-demo-docs.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  codex-final-merge-entrypoint-deploy:
+    kind: review
+    runner: codex
+    worker: codex-runtime-steward
+    acceptance_mode: auto-reported
+    title: Codex final review, fixes, verification, and commit
+    consumes:
+      - implement-launcher-cli
+      - implement-rest-server
+      - implement-deploy-telemetry
+      - integrate-entrypoint-demo-docs
+    prompt:
+      file: prompts/05-codex-final-merge-entrypoint-deploy.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - review_findings
+        - fixes
+        - verification
+        - commit
+edges:
+  - type: decomposes_to
+    from: root
+    to: implement-launcher-cli
+  - type: decomposes_to
+    from: root
+    to: implement-rest-server
+  - type: decomposes_to
+    from: root
+    to: implement-deploy-telemetry
+  - type: decomposes_to
+    from: root
+    to: integrate-entrypoint-demo-docs
+  - type: decomposes_to
+    from: root
+    to: codex-final-merge-entrypoint-deploy
+  - type: depends_on
+    from: implement-rest-server
+    to: implement-launcher-cli
+  - type: depends_on
+    from: implement-deploy-telemetry
+    to: implement-launcher-cli
+  - type: depends_on
+    from: implement-deploy-telemetry
+    to: implement-rest-server
+  - type: depends_on
+    from: integrate-entrypoint-demo-docs
+    to: implement-launcher-cli
+  - type: depends_on
+    from: integrate-entrypoint-demo-docs
+    to: implement-rest-server
+  - type: depends_on
+    from: integrate-entrypoint-demo-docs
+    to: implement-deploy-telemetry
+  - type: depends_on
+    from: codex-final-merge-entrypoint-deploy
+    to: implement-launcher-cli
+  - type: depends_on
+    from: codex-final-merge-entrypoint-deploy
+    to: implement-rest-server
+  - type: depends_on
+    from: codex-final-merge-entrypoint-deploy
+    to: implement-deploy-telemetry
+  - type: depends_on
+    from: codex-final-merge-entrypoint-deploy
+    to: integrate-entrypoint-demo-docs

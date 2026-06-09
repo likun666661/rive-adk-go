@@ -11,6 +11,7 @@ deep-read guides:
 - **Chapter 03**: Tool system — declarations, streaming, confirmation, long-running
 - **Chapter 04**: Callbacks / plugins / instruction injection
 - **Chapter 05**: Multi-agent composition — workflows, AgentTool, remote A2A
+- **Chapter 06**: Entrypoints, deploy, and telemetry — console/web routing, REST/SSE, dry-run deploy plans, instrumentation model
 
 The implementation is produced through a Rive workflow:
 
@@ -66,6 +67,13 @@ The implementation is produced through a Rive workflow:
 | `workflow` | Sequential, parallel, and loop agent orchestration |
 | `tool/agenttool` | Agent-as-tool: wraps an agent as a FunctionTool with isolated child session |
 | `agent/remoteagent` | Remote A2A bridge: streaming, conversion, partial aggregation, cleanup |
+| `cmd/launcher` | Entrypoint abstractions: Config, Launcher, SubLauncher, AgentLoader |
+| `cmd/launcher/universal` | Keyword-based router; first sublauncher is default |
+| `cmd/launcher/console` | Interactive console driving `runner.Run` from stdin |
+| `cmd/launcher/web` | HTTP server wrapper mounting adkrest endpoints |
+| `server/adkrest` | REST API server: JSON, SSE, strict request validation |
+| `deploy` | Dry-run deploy plans: CloudRunPlan, AgentEnginePlan (zero cloud calls) |
+| `telemetry` | In-memory span/log recorder with OTel-inspired instrumentation helpers |
 
 ## Quick Start
 
@@ -150,6 +158,10 @@ Output shows:
 - Chapter 05 — multi-agent composition: sequential/parallel/loop workflows,
   AgentTool delegation with isolated child sessions, and remote A2A
   streaming aggregation with partial-to-full event merging.
+- Chapter 06 — entrypoint, deploy, and telemetry: launcher config abstraction,
+  console/web routing, REST JSON/SSE protocols, deterministic dry-run deploy
+  plans (Cloud Run + Agent Engine), and in-memory telemetry recorder with
+  span/log instrumentation around runner invocations.
 
 ---
 
@@ -662,6 +674,123 @@ are simplified or omitted:
 | Gemini native tools via remote A2A | The `RemotePart` model supports `FunctionCall`/`FunctionResponse` but does not parse Gemini-specific metadata |
 
 ### Verification
+
+```bash
+go test ./...
+go vet ./...
+git diff --check
+```
+
+---
+
+## Chapter 06: Entrypoint, Deploy, Telemetry
+
+### What Chapter 06 Adds
+
+On top of the single-agent LLM loop (Chapters 01–04) and multi-agent composition
+(Chapter 05), Chapter 06 adds the **productization boundary**: how one agent
+runtime exposes itself through different entrypoints and what observability
+looks like.
+
+| Layer | Role |
+|-------|------|
+| **Launcher** | Stable `Config` abstraction carrying all services; `SubLauncher` interface for composable entrypoints; keyword-based router |
+| **REST Server** | HTTP JSON (`/run`) and SSE (`/run_sse`) endpoints wrapping `runner.Run` |
+| **Deploy Plans** | Deterministic dry-run snapshots — Cloud Run Dockerfile + gcloud commands, Agent Engine multi-stage Dockerfile + class methods + archive |
+| **Telemetry** | In-memory span/log recorder; instrumentation helpers for invoke agent, generate content, execute tool, server events |
+
+### How Launcher Config Keeps Entrypoints Stable
+
+The core design is that `launcher.Config` (at `cmd/launcher/launcher.go:36`)
+carries all service dependencies — session, memory, artifact, agent loader, and
+plugin manager. No entrypoint creates its own global singleton.
+
+```
+launcher.Config
+  → AgentLoader.RootAgent()
+  → SessionService / MemoryService / ArtifactService
+  → PluginManager (optional)
+     ↓
+  launcher.Launcher
+     ↓
+  universal.New(console, web)
+     ↓
+  no args → console.Run()
+  "web"   → web.Run()
+  other   → unknown-command error
+```
+
+Console and web don't know about each other. They only know `launcher.Config`.
+Adding a new entrypoint (e.g. gRPC) means implementing `SubLauncher` and
+registering it — no changes to runner, flow, or agent code.
+
+### Deploy and Telemetry Pieces: Dry-Run / Simplified
+
+**Deploy plans** (`deploy/cloudrun.go`, `deploy/agentengine.go`) are
+intentionally dry-run and deterministic:
+
+- No `gcloud`, `docker`, `tar`, or network calls.
+- Every run produces identical output for the same inputs.
+- Cloud Run plan generates a distroless Dockerfile with `CMD` that invokes
+  the `web` launcher with protocol flags (api, a2a, webui, etc.).
+- Agent Engine plan generates a multi-stage Dockerfile (golang builder +
+  distroless) and documents the source archive, class methods, environment
+  variables, and stream query endpoint.
+- Real deployments follow this exact shape; the dry-run plan teaches the
+  blueprint without requiring GCP credentials.
+
+**Telemetry** (`telemetry/telemetry.go`, `telemetry/instrumentation.go`) is
+in-memory and test-only:
+
+- No OpenTelemetry SDK, GCP exporter, or OTLP dependencies.
+- `Recorder` stores spans and logs in memory (thread-safe).
+- `StartInvokeAgentSpan`, `StartGenerateContentSpan`, `StartExecuteToolSpan`,
+  `StartServerEventSpan` mirror ADK Go's `internal/telemetry` patterns.
+- `WithCaptureMessageContent(false)` (default) elides message bodies as
+  `<elided>` — mirrors the `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`
+  toggle from ADK Go.
+- `Providers` wraps the recorder with `Init`/`Shutdown` lifecycle semantics.
+
+### Relation to Earlier Runtime/Workflow Layers
+
+```
+                          ┌──────────────────┐
+                          │   launcher.Config │
+                          │   (entrypoints)   │
+                          └────────┬─────────┘
+                                   │
+          ┌────────────────────────┼────────────────────────┐
+          │                        │                        │
+   console (stdin)           web (HTTP)              deploy (plans)
+          │                        │                        │
+          ▼                        ▼                        ▼
+     runner.Run              adkrest.Server         CloudRunPlan
+          │                 /run /run_sse        AgentEnginePlan
+          ▼
+   ┌──────────────┐
+   │  runner.Run   │  ←─ telemetry spans/logs wrap invocation
+   └──────┬───────┘
+          │
+          ▼
+   Chapters 01-05 layers (agent, flow, tool, workflow, plugin)
+```
+
+The runner (`runner.Run`) is the shared core. All entrypoints delegate to it.
+Telemetry instruments the runner invocation boundary (agent invoke, model
+generate, tool execute) and the server boundary (HTTP requests). Deploy plans
+explain how to package and ship this exact runtime on Cloud Run or Agent Engine.
+
+### Intentional Omissions
+
+| Omission | Reason |
+|----------|--------|
+| Real OpenTelemetry SDK (OTLP, GCP exporters) | Educational scope; the in-memory recorder demonstrates the span/log pattern |
+| `gcloud` / `docker` execution | Deploy plans are deterministic dry-run snapshots |
+| Web UI (`webui` launcher, `go:embed` bundle) | Requires upstream `google/adk-web` build; not needed for teaching |
+| A2A launcher and `adka2a` server | Chapter 05 Remote A2A covers the streaming bridge pattern |
+| Agent Engine launcher (class method handler) | Not needed without a real Vertex AI Reasoning Engine instance |
+| PubSub / Eventarc triggers | Cloud-specific and orthogonal to the agent runtime pattern |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` env-based toggling | The `WithCaptureMessageContent` option demonstrates the same pattern |
 
 ```bash
 go test ./...

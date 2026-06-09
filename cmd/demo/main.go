@@ -23,6 +23,12 @@
 //
 //	Sequential, parallel, and loop workflows; AgentTool delegation;
 //	and remote A2A streaming aggregation.
+//
+// Chapter 06 — entrypoint, deploy, and telemetry:
+//
+//	Launcher console/web routing, REST JSON/SSE protocols,
+//	dry-run deploy plans (Cloud Run + Agent Engine),
+//	and telemetry capture around a runner invocation.
 package main
 
 import (
@@ -30,12 +36,14 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/likun666661/rive-adk-go/agent"
 	"github.com/likun666661/rive-adk-go/agent/remoteagent"
 	"github.com/likun666661/rive-adk-go/artifact"
 	"github.com/likun666661/rive-adk-go/callbackctx"
 	invctx "github.com/likun666661/rive-adk-go/context"
+	"github.com/likun666661/rive-adk-go/deploy"
 	"github.com/likun666661/rive-adk-go/event"
 	"github.com/likun666661/rive-adk-go/flow"
 	"github.com/likun666661/rive-adk-go/llmagent"
@@ -43,6 +51,7 @@ import (
 	"github.com/likun666661/rive-adk-go/model"
 	"github.com/likun666661/rive-adk-go/plugin"
 	"github.com/likun666661/rive-adk-go/runner"
+	"github.com/likun666661/rive-adk-go/telemetry"
 	"github.com/likun666661/rive-adk-go/tool"
 	"github.com/likun666661/rive-adk-go/tool/agenttool"
 	"github.com/likun666661/rive-adk-go/workflow"
@@ -77,6 +86,11 @@ func run() int {
 	fmt.Println()
 
 	if code := runChapter05(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := runChapter06(); code != 0 {
 		return code
 	}
 
@@ -1344,16 +1358,16 @@ func demoLoopWorkflow() int {
 			callCount++
 			if callCount >= 3 {
 				return []*event.Event{{
-					ID:      "fix-done",
-					Author:  "fixer",
+					ID:     "fix-done",
+					Author: "fixer",
 					Content: &event.Content{Role: event.RoleModel,
 						Parts: []event.Part{{Text: "All tests pass! Stopping iteration."}}},
 					Actions: event.EventActions{Escalate: true},
 				}}, nil
 			}
 			return []*event.Event{{
-				ID:      fmt.Sprintf("fix-%d", callCount),
-				Author:  "fixer",
+				ID:     fmt.Sprintf("fix-%d", callCount),
+				Author: "fixer",
 				Content: &event.Content{Role: event.RoleModel,
 					Parts: []event.Part{{Text: fmt.Sprintf("Fix round %d: tests failing, retrying...", callCount)}}},
 			}}, nil
@@ -1611,4 +1625,274 @@ func newRawDemoAgent(name, desc string, runFn func(ctx agent.InvocationContext) 
 		Run:         runFn,
 	})
 	return a
+}
+
+// ---------------------------------------------------------------------------
+// Chapter 06 — entrypoint, deploy, and telemetry
+// ---------------------------------------------------------------------------
+
+func runChapter06() int {
+	fmt.Println("--- Chapter 06: Entrypoint, Deploy, Telemetry ---")
+	fmt.Println()
+
+	if code := demoLauncherConfig(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := demoDeployPlans(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := demoTelemetryInstrumentation(); code != 0 {
+		return code
+	}
+
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 6.1 — Launcher Config keeps entrypoints stable
+// ---------------------------------------------------------------------------
+
+func demoLauncherConfig() int {
+	fmt.Println("[Demo 6.1] Launcher Config — Stable Entrypoint Abstraction")
+	fmt.Println("  The launcher.Config carries services (session, memory, artifact,")
+	fmt.Println("  agent loader, plugin manager) so sublaunchers (console, web)")
+	fmt.Println("  don't create their own global singletons.")
+	fmt.Println()
+	fmt.Println("  launcher.Config fields:")
+	fmt.Println("    SessionService  — in-memory session store")
+	fmt.Println("    ArtifactService — versioned file store")
+	fmt.Println("    MemoryService   — cross-session long-term memory")
+	fmt.Println("    AgentLoader     — loads agent by name")
+	fmt.Println("    PluginManager   — composable hook bundles")
+	fmt.Println()
+	fmt.Println("  SubLauncher interface:")
+	fmt.Println("    Keyword()           — routing keyword (e.g. 'console', 'web')")
+	fmt.Println("    Parse(args)         — parse sublauncher flags")
+	fmt.Println("    Run(ctx, config)    — execute with launcher config")
+	fmt.Println("    CommandLineSyntax() — help text")
+	fmt.Println("    SimpleDescription() — one-line description")
+	fmt.Println()
+	fmt.Println("  Universal launcher routes first argv token to sublauncher keyword.")
+	fmt.Println("  First registered sublauncher is the default (console).")
+	fmt.Println()
+
+	// Demonstrate the universal launcher routing table.
+	fmt.Println("  Routing table:")
+	fmt.Println("    (no args)  → console (default)")
+	fmt.Println("    console    → console sublauncher")
+	fmt.Println("    web        → web sublauncher (REST + SSE)")
+	fmt.Println()
+	fmt.Println("  => Launcher config keeps agents decoupled from I/O transport.")
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 6.2 — Dry-run deploy plans (Cloud Run + Agent Engine)
+// ---------------------------------------------------------------------------
+
+func demoDeployPlans() int {
+	fmt.Println("[Demo 6.2] Dry-Run Deploy Plans (Cloud Run + Agent Engine)")
+	fmt.Println()
+
+	// --- Cloud Run dry-run plan ---
+	crPlan, err := deploy.PlanCloudRun(deploy.CloudRunConfig{
+		EntryPoint:  "cmd/myserver/main.go",
+		Project:     "my-gcp-project",
+		Region:      "us-central1",
+		ServiceName: "my-adk-service",
+		ServerPort:  8080,
+		ProxyPort:   8081,
+		Protocols:   []deploy.Protocol{deploy.ProtocolAPI, deploy.ProtocolWebUI},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Cloud Run plan error: %v\n", err)
+		return 1
+	}
+
+	fmt.Println("  --- Cloud Run Dry-Run Plan ---")
+	fmt.Printf("  Entry point:    %s\n", crPlan.EntryPoint)
+	fmt.Printf("  Binary:         %s\n", crPlan.ExecFile)
+	fmt.Printf("  GCP project:    %s\n", crPlan.Project)
+	fmt.Printf("  Region:         %s\n", crPlan.Region)
+	fmt.Printf("  Service:        %s\n", crPlan.ServiceName)
+	fmt.Printf("  Server port:    %d\n", crPlan.ServerPort)
+	fmt.Println()
+	fmt.Println("  Build command:")
+	fmt.Printf("    $ %s\n", crPlan.BuildCmd())
+	fmt.Println()
+	fmt.Println("  Dockerfile (distroless):")
+	for _, line := range strings.Split(crPlan.Dockerfile(), "\n") {
+		if strings.TrimSpace(line) != "" {
+			fmt.Printf("    %s\n", line)
+		}
+	}
+	fmt.Println()
+	fmt.Println("  Deploy command:")
+	fmt.Printf("    (gcloud run deploy with --source . --set-secrets)\n")
+	fmt.Println()
+	fmt.Println("  Local proxy:")
+	fmt.Printf("    $ %s\n", crPlan.ProxyCmd())
+	fmt.Println()
+
+	// --- Agent Engine dry-run plan ---
+	aePlan, err := deploy.PlanAgentEngine(deploy.AgentEngineConfig{
+		EntryPoint: "cmd/myagent/main.go",
+		Project:    "my-gcp-project",
+		Region:     "us-central1",
+		Name:       "my-reasoning-engine",
+		ServerPort: 8080,
+		SourceDir:  ".",
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Agent Engine plan error: %v\n", err)
+		return 1
+	}
+
+	fmt.Println("  --- Agent Engine Dry-Run Plan ---")
+	fmt.Printf("  Entry point:    %s\n", aePlan.EntryPoint)
+	fmt.Printf("  Binary:         %s\n", aePlan.ExecFile)
+	fmt.Printf("  GCP project:    %s\n", aePlan.Project)
+	fmt.Printf("  Region:         %s\n", aePlan.Region)
+	fmt.Printf("  Name:           %s\n", aePlan.Name)
+	fmt.Println()
+	fmt.Println("  Dockerfile (multi-stage: golang builder + distroless):")
+	for _, line := range strings.Split(aePlan.Dockerfile(), "\n") {
+		if strings.TrimSpace(line) != "" {
+			fmt.Printf("    %s\n", line)
+		}
+	}
+	fmt.Println()
+	fmt.Println("  Source archive command:")
+	fmt.Println("    $ tar -czf archive.tgz --exclude=.git ...")
+	fmt.Println()
+	fmt.Printf("  Stream query endpoint: %s\n", aePlan.StreamURL())
+	fmt.Println()
+	fmt.Println("  => Plans are deterministic dry-run snapshots — no gcloud, Docker,")
+	fmt.Println("     or network calls. All output is reproducible for the same input.")
+	fmt.Println("     CMD always invokes the web launcher with the relevant protocol")
+	fmt.Println("     flags (api, a2a, webui, agentengine).")
+
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 6.3 — Telemetry capture around a runner invocation
+// ---------------------------------------------------------------------------
+
+func demoTelemetryInstrumentation() int {
+	fmt.Println("[Demo 6.3] Telemetry Capture Around a Runner Invocation")
+	fmt.Println()
+
+	rec := telemetry.NewRecorder(telemetry.WithCaptureMessageContent(true))
+	ctx := stdctx.Background()
+
+	agt, err := agent.New(agent.Config{
+		Name:        "telemetry_bot",
+		Description: "Agent for telemetry demo",
+		Run: func(ctx agent.InvocationContext) ([]*event.Event, error) {
+			ev := event.NewEvent("ev-tel", "telemetry_bot", event.RoleModel)
+			ev.Content = &event.Content{
+				Role:  event.RoleModel,
+				Parts: []event.Part{{Text: "Telemetry capture is working."}},
+			}
+			return []*event.Event{ev}, nil
+		},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create agent: %v\n", err)
+		return 1
+	}
+
+	ea := runner.ExecutableAgent(agt)
+	r, err := runner.New(runner.Config{
+		AppName:        "telemetry_demo",
+		Agent:          ea,
+		SessionService: runner.NewInMemorySessionService(),
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create runner: %v\n", err)
+		return 1
+	}
+
+	invocationID := "inv-demo-1"
+	sessionID := "sess-telemetry"
+	agentName := "telemetry_bot"
+
+	// Start spans for a full invocation lifecycle.
+	invSpan := telemetry.StartInvokeAgentSpan(ctx, rec, agentName,
+		"Agent for telemetry demo", sessionID, invocationID)
+	serverSpan := telemetry.StartServerEventSpan(ctx, rec, "POST", "/run_sse")
+	telemetry.LogServerEvent(ctx, rec, "POST", "/run_sse", 200, 12*time.Millisecond)
+
+	// Run the agent.
+	_, events, err := r.Run(ctx, "user-tel", sessionID, "Show telemetry")
+	if err != nil {
+		invSpan.EndWithError("ERROR", err.Error())
+		serverSpan.EndWithError("ERROR", err.Error())
+		fmt.Fprintf(os.Stderr, "Runner.Run: %v\n", err)
+		return 1
+	}
+
+	// Model span with token usage.
+	modelSpan := telemetry.StartGenerateContentSpan(ctx, rec, "fake-model", invocationID)
+	if len(events) > 0 {
+		telemetry.SetEventID(modelSpan, events[0].ID)
+	}
+	telemetry.SetTokenUsage(modelSpan, 150, 80, 20, 10)
+	telemetry.LogRequest(ctx, rec, "You are a helpful bot.", "Show telemetry")
+	telemetry.LogResponse(ctx, rec, "STOP", "Telemetry capture is working.", nil)
+	modelSpan.End("OK")
+
+	invSpan.End("OK")
+	serverSpan.End("OK")
+
+	// Print span summary.
+	spans := rec.Spans()
+	fmt.Printf("  Recorded spans: %d\n", len(spans))
+	for i, s := range spans {
+		fmt.Printf("    [%d] %s (status=%s)\n", i+1, s.Name, s.Status)
+		for k, v := range s.Attributes {
+			fmt.Printf("         %s: %v\n", k, v)
+		}
+	}
+
+	// Print log summary.
+	logs := rec.Logs()
+	fmt.Printf("\n  Recorded logs: %d\n", len(logs))
+	for i, l := range logs {
+		fmt.Printf("    [%d] %s", i+1, l.EventName)
+		if l.Attributes != nil {
+			for k, v := range l.Attributes {
+				fmt.Printf(" (%s=%v)", k, v)
+			}
+		}
+		fmt.Println()
+	}
+
+	fmt.Println()
+	fmt.Println("  Span types recorded:")
+	fmt.Println("    invoke_agent     — agent name, session ID, invocation ID")
+	fmt.Println("    generate_content — model name, token usage, event ID")
+	fmt.Println("    server POST /run_sse — operation and path")
+	fmt.Println()
+	fmt.Println("  Log types recorded:")
+	fmt.Println("    server.request      — HTTP method, path, status, duration")
+	fmt.Println("    gen_ai.system.message — system instruction (with capture toggle)")
+	fmt.Println("    gen_ai.user.message   — user message (with capture toggle)")
+	fmt.Println("    gen_ai.choice         — model response, finish reason, tool calls")
+	fmt.Println()
+	fmt.Println("  Content capture: enabled (WithCaptureMessageContent).")
+	fmt.Println("    When disabled (default), message bodies are <elided>")
+	fmt.Println("    to avoid recording PII or secrets. This mirrors the")
+	fmt.Println("    OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT pattern")
+	fmt.Println("    from ADK Go.")
+	fmt.Println()
+	fmt.Println("  => Telemetry recorder is in-memory and thread-safe;")
+	fmt.Println("     Providers wrap the recorder with Init/Shutdown lifecycle.")
+
+	return 0
 }
