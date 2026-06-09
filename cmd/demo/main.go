@@ -24,8 +24,10 @@ import (
 	stdctx "context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/likun666661/rive-adk-go/artifact"
+	invctx "github.com/likun666661/rive-adk-go/context"
 	"github.com/likun666661/rive-adk-go/event"
 	"github.com/likun666661/rive-adk-go/flow"
 	"github.com/likun666661/rive-adk-go/llmagent"
@@ -49,6 +51,11 @@ func run() int {
 	fmt.Println()
 
 	if code := runChapter02(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := runChapter03(); code != 0 {
 		return code
 	}
 
@@ -458,4 +465,303 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// ---------------------------------------------------------------------------
+// Chapter 03 — tool system integration
+// ---------------------------------------------------------------------------
+
+func runChapter03() int {
+	fmt.Println("--- Chapter 03: Tool System Integration ---")
+	fmt.Println()
+
+	if code := demoFilteredTools(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := demoConfirmedToolCall(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := demoRejectedConfirmation(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := demoStreamingToolNonLive(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := demoLongRunningTool(); code != 0 {
+		return code
+	}
+
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 3.1 — Allowed tool filtering via FilterToolset
+// ---------------------------------------------------------------------------
+
+func demoFilteredTools() int {
+	fmt.Println("[Demo 3.1] Allowed Tool Filtering via FilterToolset")
+
+	allowedTool := tool.NewFunctionToolWithDeclaration("get_weather", "Get weather",
+		tool.NewDeclaration("get_weather", "Get weather for a city",
+			map[string]any{"type": "object", "properties": map[string]any{"city": map[string]any{"type": "string"}}},
+			nil,
+		),
+		func(args map[string]any) (map[string]any, error) {
+			city, _ := args["city"].(string)
+			return map[string]any{"city": city, "temp": 22}, nil
+		},
+	)
+
+	blockedTool := tool.NewFunctionToolWithDeclaration("delete_data", "Delete data",
+		tool.NewDeclaration("delete_data", "Delete all user data",
+			map[string]any{"type": "object"},
+			nil,
+		),
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"deleted": true}, nil
+		},
+	)
+
+	fullTs := tool.NewStaticToolset("all_tools", []tool.Tool{
+		allowedTool.(tool.Tool),
+		blockedTool.(tool.Tool),
+	})
+	filteredTs := tool.NewFilterToolset("safe_tools", fullTs,
+		tool.AllowedToolsPredicate("get_weather"),
+	)
+
+	// Capture declarations to verify only get_weather is visible.
+	var capturedNames []string
+	seen := map[string]bool{}
+	f := &flow.Flow{
+		Model: model.NewFakeModel("demo-model",
+			model.FunctionCallResponse("Let me check weather.",
+				event.FunctionCall{ID: "fc1", Name: "get_weather", Args: map[string]any{"city": "Tokyo"}},
+			),
+			model.TextResponse("Tokyo is 22°C."),
+		),
+		Tools:    map[string]tool.FunctionTool{},
+		Toolsets: []tool.Toolset{filteredTs},
+		BeforeModelCallbacks: []flow.BeforeModelCallback{
+			func(ctx invctx.InvocationContext, req *model.LLMRequest) (*model.LLMResponse, error) {
+				for _, d := range req.ToolDeclarations {
+					if dec, ok := d.(tool.Declaration); ok {
+						if !seen[dec.Name] {
+							seen[dec.Name] = true
+							capturedNames = append(capturedNames, dec.Name)
+						}
+					}
+				}
+				return nil, nil
+			},
+		},
+	}
+
+	ag, _ := llmagent.New("filter_bot", "A bot with filtered tools.", f)
+	sessionSvc := runner.NewInMemorySessionService()
+	r, err := runner.New(runner.Config{
+		AppName:        "filter_app",
+		Agent:          ag.(runner.ExecutableAgent),
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create runner: %v\n", err)
+		return 1
+	}
+
+	_, _, err = r.Run(stdctx.Background(), "user-1", "sess-filter", "Weather in Tokyo?")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Run error: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("  Declarations visible to model: %v\n", capturedNames)
+	fmt.Println("  => Only 'get_weather' is declared; 'delete_data' is filtered out.")
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 3.2 — Confirmed tool call
+// ---------------------------------------------------------------------------
+
+func demoConfirmedToolCall() int {
+	fmt.Println("[Demo 3.2] Confirmed Tool Call (Approve)")
+
+	inner := tool.NewFunctionTool("deploy_app", "Deploy the application to production",
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"deployed": true, "version": args["version"]}, nil
+		},
+	)
+
+	confirmedTool := tool.WithConfirmation(inner, true, nil)
+
+	// First call — should request confirmation.
+	result, err := confirmedTool.Run(map[string]any{"version": "v2.0"})
+	if err == nil {
+		fmt.Println("  ERROR: expected confirmation required")
+		return 1
+	}
+	fmt.Printf("  First call: requires_confirmation=%v, hint=%v\n",
+		result["confirmation_required"], result["hint"])
+	fmt.Printf("  Error: %v\n", err)
+
+	// User approves the call.
+	confirmedTool.Run(map[string]any{"version": "v2.0"}) // force confirmation required
+	if cc, ok := confirmedTool.(tool.ConfirmationControl); ok {
+		cc.SetConfirmed(true)
+	}
+
+	// Second call — should execute.
+	result, err = confirmedTool.Run(map[string]any{"version": "v2.0"})
+	if err != nil {
+		fmt.Printf("  ERROR: unexpected error after approval: %v\n", err)
+		return 1
+	}
+	fmt.Printf("  After approval: deployed=%v, version=%v\n",
+		result["deployed"], result["version"])
+
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 3.3 — Rejected confirmation path
+// ---------------------------------------------------------------------------
+
+func demoRejectedConfirmation() int {
+	fmt.Println("[Demo 3.3] Rejected Confirmation Path")
+
+	inner := tool.NewFunctionTool("drop_table", "Drop a database table",
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"dropped": true}, nil
+		},
+	)
+
+	ct := tool.WithConfirmation(inner, true, nil)
+
+	// First call — should request confirmation.
+	result, err := ct.Run(map[string]any{"table": "users"})
+	if err == nil {
+		fmt.Println("  ERROR: expected confirmation required")
+		return 1
+	}
+	fmt.Printf("  First call: requires_confirmation=%v\n", result["confirmation_required"])
+
+	// User rejects.
+	if cc, ok := ct.(tool.ConfirmationControl); ok {
+		cc.SetConfirmed(false)
+	}
+
+	// Second call — should be rejected.
+	result, err = ct.Run(map[string]any{"table": "users"})
+	if err == nil {
+		fmt.Println("  ERROR: expected confirmation rejected")
+		return 1
+	}
+	fmt.Printf("  After rejection: confirmation_rejected=%v, error=%v\n",
+		result["confirmation_rejected"], result["error"])
+	fmt.Println("  => Tool call was blocked by user rejection.")
+
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 3.4 — Streaming tool collected in non-live mode
+// ---------------------------------------------------------------------------
+
+func demoStreamingToolNonLive() int {
+	fmt.Println("[Demo 3.4] Streaming Tool Collected in Non-Live Mode")
+
+	st := tool.NewStreamingFunctionTool("generate_report", "Generate a report in chunks",
+		func(args map[string]any) ([]tool.StreamChunk, error) {
+			sections := []string{"Introduction\n", "Analysis\n", "Conclusion\n"}
+			var chunks []tool.StreamChunk
+			for i, s := range sections {
+				chunks = append(chunks, tool.StreamChunk{
+					Text:  s,
+					Final: i == len(sections)-1,
+				})
+			}
+			return chunks, nil
+		},
+	)
+
+	cr := tool.ExecuteStream("fc-001", "generate_report", map[string]any{}, st)
+	if cr.Error != "" {
+		fmt.Printf("  ERROR: %s\n", cr.Error)
+		return 1
+	}
+
+	result, _ := cr.Result["result"].(string)
+	fmt.Printf("  Collected report:\n")
+	fmt.Printf("  %s\n", indent(result, "  "))
+	fmt.Println("  => Streaming chunks were collected into a single result in non-live mode.")
+
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 3.5 — Long-running tool metadata
+// ---------------------------------------------------------------------------
+
+func demoLongRunningTool() int {
+	fmt.Println("[Demo 3.5] Long-Running Tool Metadata")
+
+	decl := tool.NewDeclaration("train_model", "Train a machine learning model",
+		map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"dataset": map[string]any{"type": "string"}},
+		},
+		map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"job_id": map[string]any{"type": "string"}, "status": map[string]any{"type": "string"}},
+		},
+	)
+
+	lr := tool.NewLongRunningFunctionTool("train_model", "Train a machine learning model", decl,
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{
+				"job_id":  "train-abc-123",
+				"status":  "pending",
+				"message": "Training job submitted. Check back later for results.",
+			}, nil
+		},
+	)
+
+	// Check IsLongRunning flag.
+	fmt.Printf("  IsLongRunning: %v\n", lr.IsLongRunning())
+
+	// Check the declaration annotation.
+	dp := lr.(tool.DeclarationProvider)
+	d := dp.Declaration()
+	fmt.Printf("  Declaration description (first 100 chars):\n")
+	fmt.Printf("  %s\n", indent(truncate(d.Description, 100), "  "))
+
+	// Execute the tool — returns pending status with job_id.
+	result, err := lr.Run(map[string]any{"dataset": "training_data.csv"})
+	if err != nil {
+		fmt.Printf("  ERROR: %v\n", err)
+		return 1
+	}
+	fmt.Printf("  Result: job_id=%v, status=%v\n", result["job_id"], result["status"])
+	fmt.Println("  => Long-running tool returns job metadata; LLM is warned not to repeat calls.")
+
+	return 0
+}
+
+func indent(s, prefix string) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		if line != "" || i < len(lines)-1 {
+			lines[i] = prefix + line
+		}
+	}
+	return strings.Join(lines, "\n")
 }

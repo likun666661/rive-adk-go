@@ -50,6 +50,19 @@ type Content struct {
 	Parts []Part `json:"parts,omitempty"`
 }
 
+// ToolConfirmation represents the state and details of a user confirmation
+// request for a tool execution.
+type ToolConfirmation struct {
+	// Hint is the message provided to the user to explain why confirmation is needed.
+	Hint string `json:"hint"`
+
+	// Confirmed indicates the user's decision: true if approved, false if denied.
+	Confirmed bool `json:"confirmed"`
+
+	// Payload contains any additional data or context related to the confirmation request.
+	Payload any `json:"payload,omitempty"`
+}
+
 // EventActions carry side-effect instructions attached to an event.
 // They are consumed by the runner or flow after the event is processed.
 type EventActions struct {
@@ -65,7 +78,19 @@ type EventActions struct {
 
 	// Escalate signals a request to escalate to a parent agent or human.
 	Escalate bool `json:"escalate,omitempty"`
+
+	// SkipSummarization signals that the agent loop should stop after this
+	// tool call (used for confirmation flows).
+	SkipSummarization bool `json:"skipSummarization,omitempty"`
+
+	// RequestedToolConfirmations maps function call IDs to pending
+	// ToolConfirmation entries that require user approval.
+	RequestedToolConfirmations map[string]ToolConfirmation `json:"requestedToolConfirmations,omitempty"`
 }
+
+// ConfirmationFunctionCallName defines the function call name emitted
+// when a Human-in-the-Loop confirmation is required.
+const ConfirmationFunctionCallName = "adk_request_confirmation"
 
 // Event is the central unit of communication in the runtime.
 //

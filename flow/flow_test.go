@@ -731,3 +731,342 @@ func TestFlowNilModelResponseReturnsError(t *testing.T) {
 		t.Fatalf("error = %q", got)
 	}
 }
+
+// =============================================================================
+// Chapter 03 — Tool system integration tests
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// Test 16: Flow with Toolsets — tool resolution
+// ---------------------------------------------------------------------------
+
+func TestFlowToolsetResolution(t *testing.T) {
+	ctx := newTestCtx("toolset_agent")
+
+	tsTool := tool.NewFunctionTool("ts_search", "Search from toolset",
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"source": "toolset", "q": args["q"]}, nil
+		},
+	)
+	ts := tool.NewStaticToolset("search_set", []tool.Tool{tsTool.(tool.Tool)})
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			model.FunctionCallResponse("Looking up from toolset.",
+				event.FunctionCall{ID: "fc1", Name: "ts_search", Args: map[string]any{"q": "test"}},
+			),
+			model.TextResponse("Search complete."),
+		),
+		Tools:    map[string]tool.FunctionTool{},
+		Toolsets: []tool.Toolset{ts},
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+
+	ev2 := events[1]
+	if ev2.Role != event.RoleTool {
+		t.Errorf("event 2 role = %q, want 'tool'", ev2.Role)
+	}
+	fr := ev2.Content.Parts[0].FunctionResponse
+	if fr == nil || fr.Name != "ts_search" {
+		t.Errorf("function response = %v", fr)
+	}
+	if src, _ := fr.Result["source"].(string); src != "toolset" {
+		t.Errorf("source = %q, want 'toolset'", src)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 17: Flow with Toolsets — declaration injection
+// ---------------------------------------------------------------------------
+
+func TestFlowToolsetDeclarationInjection(t *testing.T) {
+	ctx := newTestCtx("decl_inject_agent")
+
+	decl := tool.NewDeclaration("api_call", "Make an API call",
+		map[string]any{"type": "object", "properties": map[string]any{"endpoint": map[string]any{"type": "string"}}},
+		nil,
+	)
+	tsTool := tool.NewFunctionToolWithDeclaration("api_call", "Make an API call", decl,
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"status": "ok"}, nil
+		},
+	)
+	ts := tool.NewStaticToolset("api_set", []tool.Tool{tool.FunctionToolAsTool(tsTool)})
+
+	// Use a BeforeModelCallback to inspect the request's tool declarations.
+	var capturedDecls []any
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			model.FunctionCallResponse("Calling API.",
+				event.FunctionCall{ID: "fc1", Name: "api_call", Args: map[string]any{"endpoint": "/test"}},
+			),
+			model.TextResponse("API call complete."),
+		),
+		Tools:    map[string]tool.FunctionTool{},
+		Toolsets: []tool.Toolset{ts},
+		BeforeModelCallbacks: []BeforeModelCallback{
+			func(ctx context.InvocationContext, req *model.LLMRequest) (*model.LLMResponse, error) {
+				capturedDecls = req.ToolDeclarations
+				return nil, nil
+			},
+		},
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+
+	// Verify declarations were injected.
+	if len(capturedDecls) != 1 {
+		t.Fatalf("expected 1 tool declaration in request, got %d", len(capturedDecls))
+	}
+	d, ok := capturedDecls[0].(tool.Declaration)
+	if !ok {
+		t.Fatalf("expected Declaration type, got %T", capturedDecls[0])
+	}
+	if d.Name != "api_call" {
+		t.Errorf("declaration name = %q, want 'api_call'", d.Name)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 18: Flow with FilterToolset
+// ---------------------------------------------------------------------------
+
+func TestFlowFilteredToolset(t *testing.T) {
+	ctx := newTestCtx("filter_agent")
+
+	declA := tool.NewDeclaration("allowed_tool", "Allowed tool", nil, nil)
+	declB := tool.NewDeclaration("blocked_tool", "Blocked tool", nil, nil)
+
+	allowedTool := tool.NewFunctionToolWithDeclaration("allowed_tool", "Allowed", declA,
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"result": "allowed"}, nil
+		},
+	)
+	blockedTool := tool.NewFunctionToolWithDeclaration("blocked_tool", "Blocked", declB,
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"result": "should_not_reach"}, nil
+		},
+	)
+
+	fullTs := tool.NewStaticToolset("full", []tool.Tool{
+		tool.FunctionToolAsTool(allowedTool),
+		tool.FunctionToolAsTool(blockedTool),
+	})
+	filteredTs := tool.NewFilterToolset("filtered", fullTs, tool.AllowedToolsPredicate("allowed_tool"))
+
+	var capturedDecls []any
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			model.FunctionCallResponse("Calling allowed tool.",
+				event.FunctionCall{ID: "fc1", Name: "allowed_tool", Args: map[string]any{}},
+			),
+			model.TextResponse("Done."),
+		),
+		Tools:    map[string]tool.FunctionTool{},
+		Toolsets: []tool.Toolset{filteredTs},
+		BeforeModelCallbacks: []BeforeModelCallback{
+			func(ctx context.InvocationContext, req *model.LLMRequest) (*model.LLMResponse, error) {
+				capturedDecls = req.ToolDeclarations
+				return nil, nil
+			},
+		},
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// Only allowed_tool should be in declarations.
+	if len(capturedDecls) != 1 {
+		t.Fatalf("expected 1 filtered declaration, got %d", len(capturedDecls))
+	}
+	d := capturedDecls[0].(tool.Declaration)
+	if d.Name != "allowed_tool" {
+		t.Errorf("declaration name = %q, want 'allowed_tool'", d.Name)
+	}
+
+	// Tool should execute.
+	ev2 := events[1]
+	fr := ev2.Content.Parts[0].FunctionResponse
+	if fr.Result["result"] != "allowed" {
+		t.Errorf("result = %v, want 'allowed'", fr.Result["result"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 19: Flow with streaming tool in non-live mode
+// ---------------------------------------------------------------------------
+
+func TestFlowStreamingToolNonLiveMode(t *testing.T) {
+	ctx := newTestCtx("stream_agent")
+
+	streamTool := tool.NewStreamingFunctionToolWithDeclaration("stream_data", "Stream data",
+		tool.NewDeclaration("stream_data", "Stream data", nil, nil),
+		func(args map[string]any) ([]tool.StreamChunk, error) {
+			return []tool.StreamChunk{
+				{Text: "Hello ", Final: false},
+				{Text: "World", Final: true},
+			}, nil
+		},
+	)
+	ts := tool.NewStaticToolset("stream_set", []tool.Tool{streamTool})
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			model.FunctionCallResponse("Streaming data...",
+				event.FunctionCall{ID: "fc1", Name: "stream_data", Args: map[string]any{}},
+			),
+			model.TextResponse("Stream complete."),
+		),
+		Tools:    map[string]tool.FunctionTool{},
+		Toolsets: []tool.Toolset{ts},
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+
+	ev2 := events[1]
+	fr := ev2.Content.Parts[0].FunctionResponse
+	if fr.Result["result"] != "Hello World" {
+		t.Errorf("result = %v, want Hello World", fr.Result["result"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 20: Flow with long-running tool
+// ---------------------------------------------------------------------------
+
+func TestFlowLongRunningTool(t *testing.T) {
+	ctx := newTestCtx("longrun_agent")
+
+	decl := tool.NewDeclaration("batch_job", "A long batch job",
+		map[string]any{"type": "object"},
+		map[string]any{"type": "object"},
+	)
+	lrTool := tool.NewLongRunningFunctionTool("batch_job", "A long batch job", decl,
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"job_id": "job-123", "status": "pending"}, nil
+		},
+	)
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			model.FunctionCallResponse("Starting batch job.",
+				event.FunctionCall{ID: "fc1", Name: "batch_job", Args: map[string]any{"input": "data"}},
+			),
+			model.TextResponse("Job started with ID job-123."),
+		),
+		Tools: map[string]tool.FunctionTool{
+			"batch_job": lrTool,
+		},
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+
+	// Verify tool is marked as long-running.
+	if !lrTool.IsLongRunning() {
+		t.Error("tool should be long-running")
+	}
+
+	// Verify the long-running annotation is in the declaration.
+	dp := lrTool.(tool.DeclarationProvider)
+	d := dp.Declaration()
+	if d.Description == "" || len(d.Description) == 0 {
+		t.Error("long-running declaration description should be non-empty")
+	}
+
+	// Verify result contains job metadata.
+	ev2 := events[1]
+	fr := ev2.Content.Parts[0].FunctionResponse
+	if fr.Result["job_id"] != "job-123" {
+		t.Errorf("job_id = %v, want 'job-123'", fr.Result["job_id"])
+	}
+	if fr.Result["status"] != "pending" {
+		t.Errorf("status = %v, want 'pending'", fr.Result["status"])
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 21: Flow resolution caches toolsets (resolved once)
+// ---------------------------------------------------------------------------
+
+func TestFlowToolsetResolutionCache(t *testing.T) {
+	ctx := newTestCtx("cache_agent")
+
+	callCount := 0
+	tsTool := tool.NewFunctionTool("cached_tool", "Cached tool",
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"ok": true}, nil
+		},
+	)
+
+	dynamicTs := &countingToolset{
+		name:  "dynamic",
+		tools: []tool.Tool{tool.FunctionToolAsTool(tsTool)},
+		calls: &callCount,
+	}
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake-model",
+			model.FunctionCallResponse("Calling cached.",
+				event.FunctionCall{ID: "fc1", Name: "cached_tool", Args: map[string]any{}},
+			),
+			model.FunctionCallResponse("Calling cached again.",
+				event.FunctionCall{ID: "fc2", Name: "cached_tool", Args: map[string]any{}},
+			),
+			model.TextResponse("Done."),
+		),
+		Tools:    map[string]tool.FunctionTool{},
+		Toolsets: []tool.Toolset{dynamicTs},
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	if len(events) != 5 {
+		t.Fatalf("expected 5 events, got %d", len(events))
+	}
+
+	// Tools() should have been called only once (cached).
+	if callCount != 1 {
+		t.Errorf("Tools() call count = %d, want 1 (cached)", callCount)
+	}
+}
+
+type countingToolset struct {
+	name  string
+	tools []tool.Tool
+	calls *int
+}
+
+func (c *countingToolset) Name() string { return c.name }
+func (c *countingToolset) Tools() ([]tool.Tool, error) {
+	*c.calls++
+	return c.tools, nil
+}

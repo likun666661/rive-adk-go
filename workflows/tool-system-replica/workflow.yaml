@@ -1,0 +1,115 @@
+api_version: rive.workflow/v0
+id: rive-adk-go.tool-system-replica
+version: 1
+title: Rive ADK Go tool-system replica
+params:
+  repo_path:
+    type: string
+    required: true
+  chapter_path:
+    type: string
+    required: true
+  source_repo:
+    type: string
+    required: true
+nodes:
+  extend-tool-declaration-toolset:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-a
+    acceptance_mode: auto-reported
+    title: Extend tool declarations and toolsets
+    prompt:
+      file: prompts/01-extend-tool-declaration-toolset.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  implement-tool-context-confirmation:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-b
+    acceptance_mode: auto-reported
+    title: Implement ToolContext, confirmation, streaming, long-running semantics
+    consumes:
+      - extend-tool-declaration-toolset
+    prompt:
+      file: prompts/02-implement-tool-context-confirmation.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  integrate-tool-system-demo:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-c
+    acceptance_mode: auto-reported
+    title: Integrate tool system with flow, docs, and demos
+    consumes:
+      - extend-tool-declaration-toolset
+      - implement-tool-context-confirmation
+    prompt:
+      file: prompts/03-integrate-tool-system-demo.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  codex-final-merge-tool-system:
+    kind: review
+    runner: codex
+    worker: codex-runtime-steward
+    acceptance_mode: auto-reported
+    title: Codex final review, fixes, verification, and commit
+    consumes:
+      - extend-tool-declaration-toolset
+      - implement-tool-context-confirmation
+      - integrate-tool-system-demo
+    prompt:
+      file: prompts/04-codex-final-merge-tool-system.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - review_findings
+        - fixes
+        - verification
+        - commit
+edges:
+  - type: decomposes_to
+    from: root
+    to: extend-tool-declaration-toolset
+  - type: decomposes_to
+    from: root
+    to: implement-tool-context-confirmation
+  - type: decomposes_to
+    from: root
+    to: integrate-tool-system-demo
+  - type: decomposes_to
+    from: root
+    to: codex-final-merge-tool-system
+  - type: depends_on
+    from: implement-tool-context-confirmation
+    to: extend-tool-declaration-toolset
+  - type: depends_on
+    from: integrate-tool-system-demo
+    to: extend-tool-declaration-toolset
+  - type: depends_on
+    from: integrate-tool-system-demo
+    to: implement-tool-context-confirmation
+  - type: depends_on
+    from: codex-final-merge-tool-system
+    to: extend-tool-declaration-toolset
+  - type: depends_on
+    from: codex-final-merge-tool-system
+    to: implement-tool-context-confirmation
+  - type: depends_on
+    from: codex-final-merge-tool-system
+    to: integrate-tool-system-demo

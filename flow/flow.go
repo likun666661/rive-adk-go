@@ -53,12 +53,16 @@ type AfterToolCallback func(ctx context.InvocationContext, toolName string, args
 type Flow struct {
 	Model                model.LLM
 	Tools                map[string]tool.FunctionTool
+	Toolsets             []tool.Toolset
 	RequestProcessors    []RequestProcessor
 	ResponseProcessors   []ResponseProcessor
 	BeforeModelCallbacks []BeforeModelCallback
 	AfterModelCallbacks  []AfterModelCallback
 	BeforeToolCallbacks  []BeforeToolCallback
 	AfterToolCallbacks   []AfterToolCallback
+
+	resolvedTools    map[string]tool.Tool
+	resolvedToolList []tool.Tool
 }
 
 // Run executes the full multi‑step loop until a final response is reached.
@@ -109,6 +113,8 @@ func (f *Flow) runOneStep(ctx context.InvocationContext, step int) ([]*event.Eve
 	if ctx.Ended() {
 		return nil, nil
 	}
+
+	f.injectToolDeclarations(req)
 
 	var resp *model.LLMResponse
 	for {
@@ -299,8 +305,8 @@ func (f *Flow) executeToolCall(ctx context.InvocationContext, fc *event.Function
 		}
 	}
 
-	t, ok := f.Tools[fc.Name]
-	if !ok {
+	t := f.lookupTool(fc.Name)
+	if t == nil {
 		errMsg := fmt.Sprintf("tool %q not found", fc.Name)
 		return tool.CallResult{
 			CallID: fc.ID,
@@ -310,7 +316,21 @@ func (f *Flow) executeToolCall(ctx context.InvocationContext, fc *event.Function
 		}
 	}
 
-	cr := tool.Execute(fc.ID, fc.Name, args, t)
+	var cr tool.CallResult
+	switch executable := t.(type) {
+	case tool.StreamingFunctionTool:
+		cr = tool.ExecuteStream(fc.ID, fc.Name, args, executable)
+	case tool.FunctionTool:
+		cr = tool.Execute(fc.ID, fc.Name, args, executable)
+	default:
+		errMsg := fmt.Sprintf("tool %q is not executable", fc.Name)
+		cr = tool.CallResult{
+			CallID: fc.ID,
+			Name:   fc.Name,
+			Result: map[string]any{"error": errMsg},
+			Error:  errMsg,
+		}
+	}
 
 	for _, cb := range f.AfterToolCallbacks {
 		if cb == nil {
@@ -388,4 +408,51 @@ func mergeResultsToEvent(ctx context.InvocationContext, step int, results []tool
 	}
 
 	return ev
+}
+
+func (f *Flow) injectToolDeclarations(req *model.LLMRequest) {
+	if req == nil {
+		return
+	}
+	f.resolveToolsets()
+	tool.InjectDeclarations(req, f.resolvedToolList)
+}
+
+func (f *Flow) resolveToolsets() {
+	if f.resolvedTools != nil {
+		return
+	}
+	f.resolvedTools = make(map[string]tool.Tool, len(f.Tools))
+	for k, v := range f.Tools {
+		f.resolvedTools[k] = v
+	}
+	for _, ts := range f.Toolsets {
+		if ts == nil {
+			continue
+		}
+		tsTools, err := ts.Tools()
+		if err != nil {
+			continue
+		}
+		for _, t := range tsTools {
+			if _, exists := f.resolvedTools[t.Name()]; !exists {
+				f.resolvedTools[t.Name()] = t
+			}
+		}
+	}
+	var tools []tool.Tool
+	for _, ft := range f.resolvedTools {
+		tools = append(tools, ft)
+	}
+	f.resolvedToolList = tools
+}
+
+func (f *Flow) lookupTool(name string) tool.Tool {
+	if t, ok := f.Tools[name]; ok {
+		return t
+	}
+	if f.resolvedTools == nil {
+		f.resolveToolsets()
+	}
+	return f.resolvedTools[name]
 }

@@ -2,10 +2,12 @@ package runner
 
 import (
 	stdctx "context"
+	"strings"
 	"testing"
 
 	"github.com/likun666661/rive-adk-go/agent"
 	"github.com/likun666661/rive-adk-go/artifact"
+	invctx "github.com/likun666661/rive-adk-go/context"
 	"github.com/likun666661/rive-adk-go/event"
 	"github.com/likun666661/rive-adk-go/flow"
 	"github.com/likun666661/rive-adk-go/llmagent"
@@ -658,7 +660,7 @@ func TestRunnerTempStateLifecycle(t *testing.T) {
 			return map[string]any{
 				"state_delta": map[string]any{
 					"temp:" + key: val,
-					"durable":    "stays",
+					"durable":     "stays",
 				},
 			}, nil
 		},
@@ -1098,5 +1100,501 @@ func TestRunnerArtifactVersionIndependence(t *testing.T) {
 	// Session event count should be independent of artifact versions.
 	if sess2.EventCount() != 4 {
 		t.Errorf("event count = %d, want 4 (user1+model1+user2+model2)", sess2.EventCount())
+	}
+}
+
+// =============================================================================
+// Chapter 03 — Tool system integration tests (full chain)
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// Test 18: full chain with confirmation tool — confirm path
+// ---------------------------------------------------------------------------
+
+func TestRunnerFullChainConfirmationConfirmed(t *testing.T) {
+	inner := tool.NewFunctionTool("deploy", "Deploy to production",
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"deployed": true, "version": args["version"]}, nil
+		},
+	)
+
+	confirmedToolWrapper := tool.WithConfirmation(inner, true, nil)
+
+	fm := model.NewFakeModel("fake",
+		model.FunctionCallResponse("Let me deploy.",
+			event.FunctionCall{ID: "fc1", Name: "deploy", Args: map[string]any{"version": "v2.0"}},
+		),
+		model.TextResponse("Deployment complete."),
+	)
+
+	f := &flow.Flow{
+		Model: fm,
+		Tools: map[string]tool.FunctionTool{
+			"deploy": confirmedToolWrapper,
+		},
+	}
+
+	ag, _ := llmagent.New("deploy_bot", "test", f)
+	ea := ag.(ExecutableAgent)
+
+	sessionSvc := NewInMemorySessionService()
+	r, err := New(Config{
+		AppName:        "deploy_app",
+		Agent:          ea,
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First run — tool requires confirmation.
+	sess, events, err := r.Run(stdctx.Background(), "user-1", "sess-confirm", "Deploy v2.0")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	// Events: model(fc) → tool(confirmation required) → model(final text)
+	// The flow loop continues after tool confirmation error because the
+	// model event with function call is not IsFinalResponse.
+	// The next model response (text) is final.
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events (model+fc, tool/confirm, model/final), got %d", len(events))
+	}
+
+	// Tool result should indicate confirmation required.
+	ev2 := events[1]
+	if ev2.Role != event.RoleTool {
+		t.Errorf("event 2 role = %q, want 'tool'", ev2.Role)
+	}
+	fr := ev2.Content.Parts[0].FunctionResponse
+	if fr == nil {
+		t.Fatal("expected function response")
+	}
+	if fr.Error == "" {
+		t.Error("expected confirmation error")
+	}
+	if req, ok := fr.Result["confirmation_required"]; !ok || req != true {
+		t.Error("result should have confirmation_required = true")
+	}
+
+	// Session should have user + model(fc) + tool + model(final) = 4 events.
+	if sess.EventCount() != 4 {
+		t.Fatalf("expected 4 session events, got %d", sess.EventCount())
+	}
+
+	sessEvents := sess.Events()
+	for i, role := range []event.Role{event.RoleUser, event.RoleModel, event.RoleTool, event.RoleModel} {
+		if sessEvents[i].Role != role {
+			t.Errorf("session event[%d] role = %q, want %q", i, sessEvents[i].Role, role)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 19: full chain with streaming tool (non-live collection)
+// ---------------------------------------------------------------------------
+
+func TestRunnerFullChainStreamingTool(t *testing.T) {
+	streamTool := tool.NewStreamingFunctionToolWithDeclaration("generate_report", "Generate report",
+		tool.NewDeclaration("generate_report", "Generate report", nil, nil),
+		func(args map[string]any) ([]tool.StreamChunk, error) {
+			return []tool.StreamChunk{
+				{Text: "Section 1: Overview\n", Final: false},
+				{Text: "Section 2: Details\n", Final: false},
+				{Text: "Section 3: Summary", Final: true},
+			}, nil
+		},
+	)
+	ts := tool.NewStaticToolset("stream_set", []tool.Tool{streamTool})
+
+	fm := model.NewFakeModel("fake",
+		model.FunctionCallResponse("Generating report.",
+			event.FunctionCall{ID: "fc1", Name: "generate_report", Args: map[string]any{}},
+		),
+		model.TextResponse("Report generated successfully."),
+	)
+
+	f := &flow.Flow{
+		Model:    fm,
+		Tools:    map[string]tool.FunctionTool{},
+		Toolsets: []tool.Toolset{ts},
+	}
+
+	ag, _ := llmagent.New("report_bot", "test", f)
+	ea := ag.(ExecutableAgent)
+
+	r, err := New(Config{
+		AppName:        "stream_app",
+		Agent:          ea,
+		SessionService: NewInMemorySessionService(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sess, events, err := r.Run(stdctx.Background(), "user-1", "sess-stream", "Generate report")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	// Events: model(fc) → tool(result) → model(final) = 3
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+
+	// Tool event should contain the collected chunks.
+	ev2 := events[1]
+	if ev2.Role != event.RoleTool {
+		t.Errorf("event 2 role = %q, want 'tool'", ev2.Role)
+	}
+	fr := ev2.Content.Parts[0].FunctionResponse
+	if fr == nil {
+		t.Fatal("expected function response")
+	}
+	result, ok := fr.Result["result"].(string)
+	if !ok {
+		t.Fatal("expected string result from stream")
+	}
+	if result != "Section 1: Overview\nSection 2: Details\nSection 3: Summary" {
+		t.Errorf("stream result = %q", result)
+	}
+
+	// Session should have user + model(fc) + tool + model(final) = 4 events.
+	if sess.EventCount() != 4 {
+		t.Fatalf("expected 4 session events, got %d", sess.EventCount())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 20: full chain with long-running tool metadata
+// ---------------------------------------------------------------------------
+
+func TestRunnerFullChainLongRunningTool(t *testing.T) {
+	decl := tool.NewDeclaration("start_training", "Start model training",
+		map[string]any{"type": "object", "properties": map[string]any{"model": map[string]any{"type": "string"}}},
+		map[string]any{"type": "object", "properties": map[string]any{"job_id": map[string]any{"type": "string"}}},
+	)
+
+	lrTool := tool.NewLongRunningFunctionTool("start_training", "Start model training", decl,
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{
+				"job_id":  "train-job-001",
+				"status":  "pending",
+				"message": "Training job submitted successfully",
+			}, nil
+		},
+	)
+
+	// Use BeforeModelCallback to capture injected declarations.
+	var capturedDecls []any
+	f := &flow.Flow{
+		Model: model.NewFakeModel("fake",
+			model.FunctionCallResponse("Starting training.",
+				event.FunctionCall{ID: "fc1", Name: "start_training", Args: map[string]any{"model": "gpt"}},
+			),
+			model.TextResponse("Training job submitted."),
+		),
+		Tools: map[string]tool.FunctionTool{
+			"start_training": lrTool,
+		},
+		BeforeModelCallbacks: []flow.BeforeModelCallback{
+			func(_ invctx.InvocationContext, req *model.LLMRequest) (*model.LLMResponse, error) {
+				capturedDecls = req.ToolDeclarations
+				return nil, nil
+			},
+		},
+	}
+
+	ag, _ := llmagent.New("train_bot", "test", f)
+	ea := ag.(ExecutableAgent)
+
+	r, err := New(Config{
+		AppName:        "train_app",
+		Agent:          ea,
+		SessionService: NewInMemorySessionService(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sess, events, err := r.Run(stdctx.Background(), "user-1", "sess-train", "Train model")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	// Events: model(fc) → tool(result) → model(final) = 3
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+
+	// Tool declaration should include long-running annotation.
+	if len(capturedDecls) == 0 {
+		t.Fatal("expected tool declarations to be injected")
+	}
+	d, ok := capturedDecls[0].(tool.Declaration)
+	if !ok {
+		t.Fatalf("expected Declaration, got %T", capturedDecls[0])
+	}
+	if d.Name != "start_training" {
+		t.Errorf("declaration name = %q, want 'start_training'", d.Name)
+	}
+	if !strings.Contains(d.Description, "long-running operation") {
+		t.Error("declaration description should contain long-running annotation")
+	}
+	if !strings.Contains(d.Description, "Do not call this tool again") {
+		t.Error("declaration should include 'Do not repeat' instruction")
+	}
+
+	// Tool result should contain job metadata.
+	ev2 := events[1]
+	fr := ev2.Content.Parts[0].FunctionResponse
+	if fr == nil {
+		t.Fatal("expected function response")
+	}
+	if fr.Result["job_id"] != "train-job-001" {
+		t.Errorf("job_id = %v, want 'train-job-001'", fr.Result["job_id"])
+	}
+	if fr.Result["status"] != "pending" {
+		t.Errorf("status = %v, want 'pending'", fr.Result["status"])
+	}
+
+	// Session has all events.
+	if sess.EventCount() != 4 {
+		t.Fatalf("expected 4 session events, got %d", sess.EventCount())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 21: full chain with filtered toolset + Runner
+// ---------------------------------------------------------------------------
+
+func TestRunnerFullChainFilteredToolset(t *testing.T) {
+	allowedTool := tool.NewFunctionToolWithDeclaration("search", "Search the web",
+		tool.NewDeclaration("search", "Search the web", nil, nil),
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"results": []string{"a", "b"}}, nil
+		},
+	)
+	blockedTool := tool.NewFunctionToolWithDeclaration("delete", "Delete everything",
+		tool.NewDeclaration("delete", "Delete everything", nil, nil),
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"deleted": true}, nil
+		},
+	)
+
+	fullTs := tool.NewStaticToolset("all", []tool.Tool{
+		allowedTool.(tool.Tool),
+		blockedTool.(tool.Tool),
+	})
+	filteredTs := tool.NewFilterToolset("safe", fullTs,
+		tool.AllowedToolsPredicate("search"),
+	)
+
+	var capturedNames []string
+	f := &flow.Flow{
+		Model: model.NewFakeModel("fake",
+			model.FunctionCallResponse("Searching.",
+				event.FunctionCall{ID: "fc1", Name: "search", Args: map[string]any{"q": "test"}},
+			),
+			model.TextResponse("Search complete."),
+		),
+		Tools:    map[string]tool.FunctionTool{},
+		Toolsets: []tool.Toolset{filteredTs},
+		BeforeModelCallbacks: []flow.BeforeModelCallback{
+			func(_ invctx.InvocationContext, req *model.LLMRequest) (*model.LLMResponse, error) {
+				for _, d := range req.ToolDeclarations {
+					if dec, ok := d.(tool.Declaration); ok {
+						capturedNames = append(capturedNames, dec.Name)
+					}
+				}
+				return nil, nil
+			},
+		},
+	}
+
+	ag, _ := llmagent.New("filter_bot", "test", f)
+	ea := ag.(ExecutableAgent)
+
+	r, err := New(Config{
+		AppName:        "filter_app",
+		Agent:          ea,
+		SessionService: NewInMemorySessionService(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sess, events, err := r.Run(stdctx.Background(), "user-1", "sess-filter", "Search for test")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+
+	// Only 'search' should appear in declarations.
+	for _, name := range capturedNames {
+		if name == "delete" {
+			t.Error("'delete' tool should be filtered out of declarations")
+		}
+	}
+
+	// Tool result should be from search.
+	ev2 := events[1]
+	fr := ev2.Content.Parts[0].FunctionResponse
+	if fr.Name != "search" {
+		t.Errorf("function response name = %q, want 'search'", fr.Name)
+	}
+
+	// Session should have all events.
+	if sess.EventCount() != 4 {
+		t.Fatalf("expected 4 session events, got %d", sess.EventCount())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 22: confirmation rejection flow through runner
+// ---------------------------------------------------------------------------
+
+func TestRunnerConfirmationRejectionChain(t *testing.T) {
+	inner := tool.NewFunctionTool("risky_op", "A risky operation",
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"executed": true}, nil
+		},
+	)
+
+	confirmedWrapper := tool.WithConfirmation(inner, true, nil)
+
+	fm := model.NewFakeModel("fake",
+		model.FunctionCallResponse("Let me try risky operation.",
+			event.FunctionCall{ID: "fc1", Name: "risky_op", Args: map[string]any{"target": "prod"}},
+		),
+		model.TextResponse("Operation was rejected by user."),
+	)
+
+	f := &flow.Flow{
+		Model: fm,
+		Tools: map[string]tool.FunctionTool{
+			"risky_op": confirmedWrapper,
+		},
+	}
+
+	ag, _ := llmagent.New("risky_bot", "test", f)
+	ea := ag.(ExecutableAgent)
+
+	r, err := New(Config{
+		AppName:        "risk_app",
+		Agent:          ea,
+		SessionService: NewInMemorySessionService(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sess, events, err := r.Run(stdctx.Background(), "user-1", "sess-reject", "Risky operation")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	// Events: model(fc) → tool(confirmation required) → model(final text) = 3
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events (model+fc, tool/confirm, model/final), got %d", len(events))
+	}
+
+	// Tool result should indicate confirmation required.
+	ev2 := events[1]
+	fr := ev2.Content.Parts[0].FunctionResponse
+	if req, ok := fr.Result["confirmation_required"]; !ok || req != true {
+		t.Error("result should have confirmation_required = true")
+	}
+	if fr.Error == "" {
+		t.Error("expected confirmation required error")
+	}
+
+	// Session should have user + model(fc) + tool(confirm) + model(final) = 4.
+	if sess.EventCount() != 4 {
+		t.Fatalf("expected 4 session events, got %d", sess.EventCount())
+	}
+
+	// Verify session event roles.
+	sessEvents := sess.Events()
+	wantRoles := []event.Role{event.RoleUser, event.RoleModel, event.RoleTool, event.RoleModel}
+	for i, want := range wantRoles {
+		if sessEvents[i].Role != want {
+			t.Errorf("session event[%d] role = %q, want %q", i, sessEvents[i].Role, want)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 23: toolset with declaration injection through full chain
+// ---------------------------------------------------------------------------
+
+func TestRunnerFullChainToolsetDeclarations(t *testing.T) {
+	decl := tool.NewDeclaration("get_weather", "Get weather", nil, nil)
+	tsTool := tool.NewFunctionToolWithDeclaration("get_weather", "Get weather", decl,
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"temp": 25}, nil
+		},
+	)
+	ts := tool.NewStaticToolset("weather_set", []tool.Tool{tsTool.(tool.Tool)})
+
+	var capturedDecls []any
+	f := &flow.Flow{
+		Model: model.NewFakeModel("fake",
+			model.FunctionCallResponse("Checking weather.",
+				event.FunctionCall{ID: "fc1", Name: "get_weather", Args: map[string]any{"city": "Paris"}},
+			),
+			model.TextResponse("Paris is 25°C."),
+		),
+		Tools:    map[string]tool.FunctionTool{},
+		Toolsets: []tool.Toolset{ts},
+		BeforeModelCallbacks: []flow.BeforeModelCallback{
+			func(_ invctx.InvocationContext, req *model.LLMRequest) (*model.LLMResponse, error) {
+				capturedDecls = req.ToolDeclarations
+				return nil, nil
+			},
+		},
+	}
+
+	ag, _ := llmagent.New("weather_bot", "test", f)
+	ea := ag.(ExecutableAgent)
+
+	r, err := New(Config{
+		AppName:        "toolset_app",
+		Agent:          ea,
+		SessionService: NewInMemorySessionService(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sess, events, err := r.Run(stdctx.Background(), "user-1", "sess-ts", "Weather in Paris?")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+
+	// Declarations must be injected.
+	if len(capturedDecls) == 0 {
+		t.Fatal("expected declarations to be injected from toolset")
+	}
+
+	// Tool must execute from toolset.
+	ev2 := events[1]
+	fr := ev2.Content.Parts[0].FunctionResponse
+	if fr.Name != "get_weather" {
+		t.Errorf("function response name = %q, want 'get_weather'", fr.Name)
+	}
+	if temp, ok := fr.Result["temp"]; !ok || temp != 25 {
+		t.Errorf("temp = %v, want 25", temp)
+	}
+
+	if sess.EventCount() != 4 {
+		t.Fatalf("expected 4 session events, got %d", sess.EventCount())
 	}
 }

@@ -14,8 +14,9 @@ import (
 
 // LLMRequest is the request sent to a model.
 type LLMRequest struct {
-	Model    string
-	Contents []LLMContent
+	Model            string
+	Contents         []LLMContent
+	ToolDeclarations []any
 }
 
 // LLMContent represents a single message in the conversation history.
@@ -112,5 +113,22 @@ func ErrorResponse(code, message string) *LLMResponse {
 	return &LLMResponse{
 		ErrorCode:    code,
 		ErrorMessage: message,
+	}
+}
+
+// FunctionResponseResponse creates an LLMResponse containing function responses
+// (typically used to confirm or reject tool calls).
+func FunctionResponseResponse(text string, responses ...event.FunctionResponse) *LLMResponse {
+	content := &LLMContent{Role: "model"}
+	if text != "" {
+		content.Parts = append(content.Parts, LLMPart{Text: text})
+	}
+	for _, fr := range responses {
+		frCopy := fr
+		content.Parts = append(content.Parts, LLMPart{FunctionResponse: &frCopy})
+	}
+	return &LLMResponse{
+		Content:      content,
+		TurnComplete: true,
 	}
 }
