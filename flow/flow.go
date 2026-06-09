@@ -429,6 +429,9 @@ func (f *Flow) executeToolCall(ctx context.InvocationContext, fc *event.Function
 	switch executable := t.(type) {
 	case tool.StreamingFunctionTool:
 		cr = tool.ExecuteStream(fc.ID, fc.Name, args, executable)
+	case tool.ContextFunctionTool:
+		ttctx := tool.NewToolContext(ctx, fc.ID, actions, nil)
+		cr = tool.ContextExecute(ttctx, fc.ID, fc.Name, args, executable)
 	case tool.FunctionTool:
 		cr = tool.Execute(fc.ID, fc.Name, args, executable)
 	default:

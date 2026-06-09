@@ -8,6 +8,9 @@ deep-read guides:
 
 - **Chapter 01**: `Runner -> Agent -> LLM Flow -> Model/Tool -> Event -> Session`
 - **Chapter 02**: State lifecycle — session scoping, memory, and artifacts
+- **Chapter 03**: Tool system — declarations, streaming, confirmation, long-running
+- **Chapter 04**: Callbacks / plugins / instruction injection
+- **Chapter 05**: Multi-agent composition — workflows, AgentTool, remote A2A
 
 The implementation is produced through a Rive workflow:
 
@@ -60,6 +63,9 @@ The implementation is produced through a Rive workflow:
 | `context` | Invocation context carrying agent, session, memory, artifact services |
 | `memory` | Cross-session long-term memory with keyword search |
 | `artifact` | Versioned file store scoped by app/user/session |
+| `workflow` | Sequential, parallel, and loop agent orchestration |
+| `tool/agenttool` | Agent-as-tool: wraps an agent as a FunctionTool with isolated child session |
+| `agent/remoteagent` | Remote A2A bridge: streaming, conversion, partial aggregation, cleanup |
 
 ## Quick Start
 
@@ -138,6 +144,12 @@ Output shows:
 - Chapter 03 — tool system integration: declaration injection, toolset
   filtering, confirmation (approve/reject), streaming tool collection,
   and long-running tool metadata.
+- Chapter 04 — callbacks, plugins, and instruction injection: logging
+  plugins, before-model cache early-exit, state-driven instruction
+  interpolation, and plugin/callback ordering.
+- Chapter 05 — multi-agent composition: sequential/parallel/loop workflows,
+  AgentTool delegation with isolated child sessions, and remote A2A
+  streaming aggregation with partial-to-full event merging.
 
 ---
 
@@ -464,6 +476,192 @@ teaching model).
 | `RetryAndReflect` plugin | The retry loop requires multi-turn LLM coordination; the before-model cache demo covers the early-exit pattern |
 | Configurable layer (YAML → plugin wiring) | Plugins are registered programmatically; YAML mapping is deferred |
 | `FunctionCallModifier` (tool schema rewriting) | The `InjectDeclarations` mechanism in flow serves a similar purpose for tool declaration injection |
+
+```bash
+go test ./...
+go vet ./...
+git diff --check
+```
+
+---
+
+## Chapter 05: Workflow Agents / AgentTool / Remote A2A
+
+### What Chapter 05 Adds
+
+On top of the single-agent LLM loop (Chapters 01–04), Chapter 05 adds a
+multi-agent **composition layer** with three distinct delegation mechanisms:
+
+| Mechanism | What it does | Use case |
+|-----------|-------------|----------|
+| **SequentialAgent** | Runs sub-agents one at a time in declaration order. Events concatenate sequentially. | Pipeline: code-gen → review → fix |
+| **ParallelAgent** | Runs sub-agents concurrently. Branch labels (`parent.child`) on each event. Results emitted in declaration order. | Multi-perspective analysis, ensemble review |
+| **LoopAgent** | Runs sub-agents repeatedly until max iterations or `Actions.Escalate`. | Iterative fix-then-test, optimization loops |
+| **AgentTool** | Wraps an agent as a `FunctionTool`. Child runs in an isolated session with parent state copied (minus `_adk` internals). | On-demand delegation: "I need a math agent" |
+| **RemoteAgent** | Bridges local invocation to a remote A2A stream. Supports partial-to-full event aggregation, cleanup callbacks, and custom converters. | Cloud agent proxies, service meshes |
+
+### How Workflow Agents Differ from Tool Delegation and Remote Delegation
+
+| Dimension | Workflow Agent (Sequential/Parallel/Loop) | AgentTool (Agent as Tool) | Remote A2A |
+|-----------|------------------------------------------|--------------------------|------------|
+| **Session** | Shared session; sub-agents see each other's state | Isolated child session; non-`_adk` parent state copied | Remote session (opaque to local) |
+| **Invocation** | Sub-agents execute as part of the same `Execute()` call | Child invoked synchronously via `Tool.Run()` — blocks parent LLM | Network RPC via `A2AClient.SendStreamingMessage()` |
+| **Lifecycle** | Parent agent owns the full sub-agent sequence/loop | Child runner created per tool call; disposed after result | Remote task lifecycle managed with `cleanupRemoteTask` / `CancelTask` |
+| **Event model** | Sub-agent events flow through parent's event iterator | Child events collected internally; last text result returned | A2A events converted via `Converter` then aggregated via `aggregator` |
+| **Error semantics** | First sub-agent error stops chain (sequential) or propagates with partial results (parallel) | Error returned as tool result | Stream/convert/cleanup errors combined and returned |
+| **State sharing** | Direct — writes to same session state | Explicit copy — `_adk` filtered, no write-back | N/A — remote session is opaque |
+
+### Architecture: Composition Layer
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                       Runner.Run                              │
+│  session.Get/Create → append user event → create ctx          │
+│  → agent.Execute → persist non-partial events → yield         │
+└──────────────────────────┬───────────────────────────────────┘
+                            │
+                            ▼
+┌──────────────────────────────────────────────────────────────┐
+│                  Workflow Agent (composed)                     │
+│                                                               │
+│  Sequential: subAgent[0] → subAgent[1] → ... → subAgent[N]   │
+│  Parallel:   subAgent[0] ∥ subAgent[1] ∥ ... ∥ subAgent[N]  │
+│  Loop:       for { subAgent[0] → ... → subAgent[N] }         │
+│                                                               │
+│  Each sub-agent can be:                                       │
+│    • LLM agent (local)                                        │
+│    • Another workflow agent (nesting)                         │
+│    • Remote agent (A2A bridge)                                │
+│    • AgentTool (via parent LLM function call)                 │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Sequential Workflow
+
+```go
+coder := newDemoAgent("coder", "Generates Go code.",
+    model.TextResponse("func Add(a, b int) int { return a + b }"),
+)
+reviewer := newDemoAgent("reviewer", "Reviews Go code.",
+    model.TextResponse("Review passed: function is correct."),
+)
+
+seq := workflow.NewSequentialAgent("pipeline", "code-gen → review",
+    []workflow.SubAgent{coder, reviewer},
+)
+
+r, _ := runner.New(runner.Config{AppName: "demo", Agent: seq, SessionService: ...})
+_, events, _ := r.Run(ctx, "user-1", "sess-1", "Write an Add function")
+// events[0].Author == "coder"
+// events[1].Author == "reviewer"
+```
+
+**Key semantics:**
+- Strict order — each sub-agent's events are fully consumed before the next starts.
+- Shared session — state written by `coder` is visible to `reviewer`.
+- `EndInvocation()` from any sub-agent stops the chain.
+
+### Parallel Workflow
+
+```go
+par := workflow.NewParallelAgent("review-team", "parallel review",
+    []workflow.SubAgent{analyst, critic, evaluator},
+)
+
+_, events, _ := r.Run(ctx, "user-1", "sess-1", "Analyze")
+// Each event carries branch label "review-team.analyst", etc.
+```
+
+**Key semantics:**
+- All sub-agents run concurrently via goroutines.
+- Results collected via buffered channel, emitted in declaration order (deterministic).
+- Branch labels on events enable event grouping by sub-agent identity.
+- First error propagates; all successful events preserved.
+
+### Loop Workflow
+
+```go
+loop := workflow.NewLoopAgent("fix-loop", "fix-then-test",
+    []workflow.SubAgent{fixer}, 10,  // max 10 iterations
+)
+
+// Sub-agent sets event.Actions.Escalate = true to stop early.
+```
+
+**Key semantics:**
+- `maxIterations=0` means infinite loop (stopped only by escalate or error).
+- Each full pass through all sub-agents counts as one iteration.
+- `Actions.Escalate` is the cooperative stop signal.
+
+### AgentTool Delegation
+
+```go
+childAgent, _ := agent.New(agent.Config{
+    Name: "math_agent", Description: "Solves math problems.",
+    Run: func(ctx agent.InvocationContext) ([]*event.Event, error) {
+        return []*event.Event{eventWithText("42")}, nil
+    },
+})
+
+at := agenttool.New(childAgent, nil)
+ft := at.(tool.FunctionTool)
+
+parentFlow := &flow.Flow{
+    Model: fakeModel,
+    Tools: map[string]tool.FunctionTool{"math_agent": ft},
+}
+```
+
+**Key semantics:**
+- Child runs in a new `InMemorySessionService` — fully isolated.
+- Non-internal parent state (`_adk`-prefixed keys excluded) copied into child session.
+- Child output returned as `{"result": "<last text>"}`.
+- `SkipSummarization` config flag stops parent agent loop after delegation.
+
+### Remote A2A Streaming
+
+```go
+cfg := remoteagent.FakeA2AClientConfig{
+    Card:  remoteagent.AgentCard{Name: "remote-kb", StreamingSupported: true},
+    Events: []remoteagent.StreamEvent{
+        {Event: &remoteagent.RemoteEvent{Type: ..., Parts: []remoteagent.RemotePart{{Text: "chunk1"}}, Append: true}},
+        {Event: &remoteagent.RemoteEvent{Type: ..., Parts: []remoteagent.RemotePart{{Text: "chunk2"}}, Append: true, LastChunk: true}},
+        {Event: &remoteagent.RemoteEvent{Type: ..., State: remoteagent.TaskStateCompleted}},
+    },
+}
+
+remoteAgent, _ := remoteagent.NewRemoteAgent(remoteagent.RemoteAgentConfig{
+    Name: "kb-bridge", AgentCard: cfg.Card,
+    ClientProvider: func(card remoteagent.AgentCard) (remoteagent.A2AClient, error) {
+        return remoteagent.NewFakeA2AClient(cfg), nil
+    },
+    CleanupCallbacks: []remoteagent.CleanupCallback{...},
+})
+```
+
+**Key semantics:**
+- `A2AClient` interface: `SendStreamingMessage`, `CancelTask`, `Destroy`.
+- `Converter` maps `RemoteEvent` → `[]*session.Event`. Default handles all 3 event types.
+- `aggregator` accumulates `Append` chunks; flushes on `LastChunk` or terminal status.
+- `CleanupCallback`s invoked in order on stream error or context cancellation.
+
+### What Is Intentionally Simplified
+
+This replica is an educational teaching model. The following real ADK Go features
+are simplified or omitted:
+
+| Omission | Reason |
+|----------|--------|
+| `RunLive` (bidi streaming for sequential agent) | Requires `task_completed` tool injection and multi-session routing; the sync `Execute` model suffices for teaching |
+| Per-event backpressure (`ackChan`) in parallel agent | Simplified to collection-then-order; backpressure is irrelevant for `[]*event.Event` (not `iter.Seq2`) |
+| Real network A2A (REST/gRPC) | `FakeA2AClient` uses Go channels for in-memory streaming; the interface is extensible to real transports |
+| A2A v0/v1 protocol version negotiation | This replica defines its own simplified `RemoteEvent` model; no JSON-RPC or protocol negotiation |
+| `OutputArtifactPerEvent` vs `OutputArtifactPerRun` artifact modes | Aggregation is text-part-only; no artifact service integration |
+| MCP toolset in AgentTool context | AgentTool uses the local tool/runner sandbox only; no external process lifecycle |
+| `IsLongRunning` for AgentTool | Always returns `false` — agent-as-tool is synchronous in this model |
+| Gemini native tools via remote A2A | The `RemotePart` model supports `FunctionCall`/`FunctionResponse` but does not parse Gemini-specific metadata |
+
+### Verification
 
 ```bash
 go test ./...

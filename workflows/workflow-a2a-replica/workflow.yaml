@@ -1,0 +1,146 @@
+api_version: rive.workflow/v0
+id: rive-adk-go.workflow-a2a-replica
+version: 1
+title: Rive ADK Go workflow and A2A replica
+params:
+  repo_path:
+    type: string
+    required: true
+  chapter_path:
+    type: string
+    required: true
+  source_repo:
+    type: string
+    required: true
+nodes:
+  implement-workflow-agents:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-a
+    acceptance_mode: auto-reported
+    title: Implement sequential, parallel, and loop workflow agents
+    prompt:
+      file: prompts/01-implement-workflow-agents.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  implement-agent-tool-sandbox:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-b
+    acceptance_mode: auto-reported
+    title: Implement AgentTool sandbox delegation
+    consumes:
+      - implement-workflow-agents
+    prompt:
+      file: prompts/02-implement-agent-tool-sandbox.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  implement-remote-a2a:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-c
+    acceptance_mode: auto-reported
+    title: Implement lightweight remote A2A bridge
+    consumes:
+      - implement-workflow-agents
+    prompt:
+      file: prompts/03-implement-remote-a2a.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  integrate-workflow-a2a-demo:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-a
+    acceptance_mode: auto-reported
+    title: Integrate workflow/A2A demo, docs, and tests
+    consumes:
+      - implement-workflow-agents
+      - implement-agent-tool-sandbox
+      - implement-remote-a2a
+    prompt:
+      file: prompts/04-integrate-workflow-a2a-demo.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  codex-final-merge-workflow-a2a:
+    kind: review
+    runner: codex
+    worker: codex-runtime-steward
+    acceptance_mode: auto-reported
+    title: Codex final review, fixes, verification, and commit
+    consumes:
+      - implement-workflow-agents
+      - implement-agent-tool-sandbox
+      - implement-remote-a2a
+      - integrate-workflow-a2a-demo
+    prompt:
+      file: prompts/05-codex-final-merge-workflow-a2a.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - review_findings
+        - fixes
+        - verification
+        - commit
+edges:
+  - type: decomposes_to
+    from: root
+    to: implement-workflow-agents
+  - type: decomposes_to
+    from: root
+    to: implement-agent-tool-sandbox
+  - type: decomposes_to
+    from: root
+    to: implement-remote-a2a
+  - type: decomposes_to
+    from: root
+    to: integrate-workflow-a2a-demo
+  - type: decomposes_to
+    from: root
+    to: codex-final-merge-workflow-a2a
+  - type: depends_on
+    from: implement-agent-tool-sandbox
+    to: implement-workflow-agents
+  - type: depends_on
+    from: implement-remote-a2a
+    to: implement-workflow-agents
+  - type: depends_on
+    from: integrate-workflow-a2a-demo
+    to: implement-workflow-agents
+  - type: depends_on
+    from: integrate-workflow-a2a-demo
+    to: implement-agent-tool-sandbox
+  - type: depends_on
+    from: integrate-workflow-a2a-demo
+    to: implement-remote-a2a
+  - type: depends_on
+    from: codex-final-merge-workflow-a2a
+    to: implement-workflow-agents
+  - type: depends_on
+    from: codex-final-merge-workflow-a2a
+    to: implement-agent-tool-sandbox
+  - type: depends_on
+    from: codex-final-merge-workflow-a2a
+    to: implement-remote-a2a
+  - type: depends_on
+    from: codex-final-merge-workflow-a2a
+    to: integrate-workflow-a2a-demo

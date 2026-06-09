@@ -18,6 +18,11 @@
 //	  - temp: state visible during invocation, trimmed on persist
 //	  - artifact save/load with versioning
 //	  - memory add/search across sessions
+//
+// Chapter 05 — multi-agent composition:
+//
+//	Sequential, parallel, and loop workflows; AgentTool delegation;
+//	and remote A2A streaming aggregation.
 package main
 
 import (
@@ -26,6 +31,8 @@ import (
 	"os"
 	"strings"
 
+	"github.com/likun666661/rive-adk-go/agent"
+	"github.com/likun666661/rive-adk-go/agent/remoteagent"
 	"github.com/likun666661/rive-adk-go/artifact"
 	"github.com/likun666661/rive-adk-go/callbackctx"
 	invctx "github.com/likun666661/rive-adk-go/context"
@@ -37,6 +44,8 @@ import (
 	"github.com/likun666661/rive-adk-go/plugin"
 	"github.com/likun666661/rive-adk-go/runner"
 	"github.com/likun666661/rive-adk-go/tool"
+	"github.com/likun666661/rive-adk-go/tool/agenttool"
+	"github.com/likun666661/rive-adk-go/workflow"
 )
 
 func main() {
@@ -63,6 +72,11 @@ func run() int {
 	fmt.Println()
 
 	if code := runChapter04(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := runChapter05(); code != 0 {
 		return code
 	}
 
@@ -1183,4 +1197,418 @@ func indent(s, prefix string) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// ---------------------------------------------------------------------------
+// Chapter 05 — workflow / AgentTool / remote A2A integration
+// ---------------------------------------------------------------------------
+
+func runChapter05() int {
+	fmt.Println("--- Chapter 05: Workflow / AgentTool / Remote A2A Integration ---")
+	fmt.Println()
+
+	if code := demoSequentialWorkflow(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := demoParallelWorkflow(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := demoLoopWorkflow(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := demoAgentToolDelegation(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := demoRemoteA2AStreaming(); code != 0 {
+		return code
+	}
+
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 5.1 — Sequential workflow: two sub-agents execute in order
+// ---------------------------------------------------------------------------
+
+func demoSequentialWorkflow() int {
+	fmt.Println("[Demo 5.1] Sequential Workflow — code generator → code reviewer")
+
+	coder := newDemoAgent("coder", "Generates Go code.",
+		model.TextResponse("func Add(a, b int) int { return a + b }"),
+	)
+	reviewer := newDemoAgent("reviewer", "Reviews Go code.",
+		model.TextResponse("Review passed: function is correct and idiomatic."),
+	)
+
+	seq := workflow.NewSequentialAgent("pipeline", "code-gen → review pipeline",
+		[]workflow.SubAgent{coder, reviewer},
+	)
+
+	sessionSvc := runner.NewInMemorySessionService()
+	r, err := runner.New(runner.Config{
+		AppName:        "demo_seq",
+		Agent:          seq,
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create runner: %v\n", err)
+		return 1
+	}
+
+	_, events, err := r.Run(stdctx.Background(), "user-1", "sess-seq", "Write an Add function")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Run error: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("  %d events produced (coder → reviewer):\n", len(events))
+	for i, ev := range events {
+		text := ""
+		if ev.Content != nil && len(ev.Content.Parts) > 0 {
+			text = ev.Content.Parts[0].Text
+		}
+		fmt.Printf("    [%d] %s: %q\n", i+1, ev.Author, truncate(text, 60))
+	}
+	fmt.Println("  => Coder output visible to reviewer via shared session state.")
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 5.2 — Parallel workflow with branch labels
+// ---------------------------------------------------------------------------
+
+func demoParallelWorkflow() int {
+	fmt.Println("[Demo 5.2] Parallel Workflow — analyst, critic, evaluator run concurrently")
+
+	analyst := newDemoAgent("analyst", "Market analyst.",
+		model.TextResponse("Market trend: upward, growth 12% YoY."),
+	)
+	critic := newDemoAgent("critic", "Critical reviewer.",
+		model.TextResponse("Critique: over-optimistic, missing risk factors."),
+	)
+	evaluator := newDemoAgent("evaluator", "Evaluator.",
+		model.TextResponse("Score: 7/10. Solid analysis but needs risk assessment."),
+	)
+
+	par := workflow.NewParallelAgent("review-team", "parallel review",
+		[]workflow.SubAgent{analyst, critic, evaluator},
+	)
+
+	sessionSvc := runner.NewInMemorySessionService()
+	r, err := runner.New(runner.Config{
+		AppName:        "demo_par",
+		Agent:          par,
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create runner: %v\n", err)
+		return 1
+	}
+
+	_, events, err := r.Run(stdctx.Background(), "user-1", "sess-par", "Analyze the market")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Run error: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("  %d events (concurrent, ordered by declaration):\n", len(events))
+	for i, ev := range events {
+		text := ""
+		if ev.Content != nil && len(ev.Content.Parts) > 0 {
+			text = ev.Content.Parts[0].Text
+		}
+		fmt.Printf("    [%d] %s (branch=%q): %q\n", i+1, ev.Author, ev.Branch, truncate(text, 50))
+	}
+	fmt.Println("  => Each event carries a branch label 'parent.child' for event grouping.")
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 5.3 — Loop workflow with early stop via Escalate
+// ---------------------------------------------------------------------------
+
+func demoLoopWorkflow() int {
+	fmt.Println("[Demo 5.3] Loop Workflow — code fix loop with Escalate early stop")
+
+	callCount := 0
+	fixer := newRawDemoAgent("fixer", "Iterative code fixer.",
+		func(ctx agent.InvocationContext) ([]*event.Event, error) {
+			callCount++
+			if callCount >= 3 {
+				return []*event.Event{{
+					ID:      "fix-done",
+					Author:  "fixer",
+					Content: &event.Content{Role: event.RoleModel,
+						Parts: []event.Part{{Text: "All tests pass! Stopping iteration."}}},
+					Actions: event.EventActions{Escalate: true},
+				}}, nil
+			}
+			return []*event.Event{{
+				ID:      fmt.Sprintf("fix-%d", callCount),
+				Author:  "fixer",
+				Content: &event.Content{Role: event.RoleModel,
+					Parts: []event.Part{{Text: fmt.Sprintf("Fix round %d: tests failing, retrying...", callCount)}}},
+			}}, nil
+		},
+	)
+
+	loop := workflow.NewLoopAgent("fix-loop", "iterative code fix loop",
+		[]workflow.SubAgent{fixer}, 10,
+	)
+
+	sessionSvc := runner.NewInMemorySessionService()
+	r, err := runner.New(runner.Config{
+		AppName:        "demo_loop",
+		Agent:          loop,
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create runner: %v\n", err)
+		return 1
+	}
+
+	_, events, err := r.Run(stdctx.Background(), "user-1", "sess-loop", "Fix the code")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Run error: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("  %d iterations before escalate (max=10):\n", callCount)
+	for i, ev := range events {
+		text := ""
+		if ev.Content != nil && len(ev.Content.Parts) > 0 {
+			text = ev.Content.Parts[0].Text
+		}
+		esc := ""
+		if ev.Actions.Escalate {
+			esc = " [ESCALATE]"
+		}
+		fmt.Printf("    [%d] %s: %q%s\n", i+1, ev.Author, text, esc)
+	}
+	fmt.Println("  => Agent signals loop termination via Actions.Escalate=true.")
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 5.4 — AgentTool delegation (agent as tool inside parent flow)
+// ---------------------------------------------------------------------------
+
+func demoAgentToolDelegation() int {
+	fmt.Println("[Demo 5.4] AgentTool Delegation — parent agent delegates to math_agent tool")
+
+	// Child agent: wrapped as a tool.
+	childAgent, err := agent.New(agent.Config{
+		Name:        "math_agent",
+		Description: "Solves math problems. Input: a description of the problem.",
+		Run: func(ctx agent.InvocationContext) ([]*event.Event, error) {
+			ev := event.NewEvent("math-result", "math_agent", event.RoleModel)
+			ev.Content = &event.Content{
+				Role:  event.RoleModel,
+				Parts: []event.Part{{Text: "42"}},
+			}
+			return []*event.Event{ev}, nil
+		},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create child agent: %v\n", err)
+		return 1
+	}
+
+	at := agenttool.New(childAgent, nil)
+	ft, ok := at.(tool.FunctionTool)
+	if !ok {
+		fmt.Fprintln(os.Stderr, "agenttool does not implement FunctionTool")
+		return 1
+	}
+
+	// Parent agent with math_agent as a registered tool.
+	fakeModel := model.NewFakeModel("orchestrator-model",
+		model.FunctionCallResponse("Let me delegate to the math agent.",
+			event.FunctionCall{ID: "fc-math", Name: "math_agent", Args: map[string]any{"request": "what is 6*7"}},
+		),
+		model.TextResponse("The math agent says the answer is 42."),
+	)
+
+	parentFlow := &flow.Flow{
+		Model: fakeModel,
+		Tools: map[string]tool.FunctionTool{
+			"math_agent": ft,
+		},
+	}
+
+	parentAgent, err := llmagent.New("orchestrator", "Parent agent with delegation capability.", parentFlow)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create parent agent: %v\n", err)
+		return 1
+	}
+
+	sessionSvc := runner.NewInMemorySessionService()
+	r, err := runner.New(runner.Config{
+		AppName:        "demo_agenttool",
+		Agent:          parentAgent.(runner.ExecutableAgent),
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create runner: %v\n", err)
+		return 1
+	}
+
+	_, events, err := r.Run(stdctx.Background(), "user-1", "sess-at", "What is 6*7?")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Run error: %v\n", err)
+		return 1
+	}
+
+	for _, ev := range events {
+		if ev.Content != nil {
+			for _, p := range ev.Content.Parts {
+				switch {
+				case p.FunctionCall != nil:
+					fmt.Printf("  [%s] FunctionCall → %s(args=%v)\n", ev.Author, p.FunctionCall.Name, p.FunctionCall.Args)
+				case p.FunctionResponse != nil:
+					fmt.Printf("  [%s] FunctionResponse ← %s => %v\n", ev.Author, p.FunctionResponse.Name, p.FunctionResponse.Result)
+				case p.Text != "":
+					fmt.Printf("  [%s] %q\n", ev.Author, truncate(p.Text, 60))
+				}
+			}
+		}
+	}
+	fmt.Println("  => Child agent runs in isolated session; parent receives result via tool interface.")
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 5.5 — Remote A2A streaming aggregation
+// ---------------------------------------------------------------------------
+
+func demoRemoteA2AStreaming() int {
+	fmt.Println("[Demo 5.5] Remote A2A Streaming — aggregated partial chunks from remote KB agent")
+
+	fakeCfg := remoteagent.FakeA2AClientConfig{
+		Card: remoteagent.AgentCard{
+			Name:               "remote-kb",
+			Description:        "Remote knowledge base with streaming support",
+			StreamingSupported: true,
+			Capabilities:       []string{"knowledge-retrieval", "streaming"},
+		},
+		Events: []remoteagent.StreamEvent{
+			// Simulated streaming chunks from a remote A2A service.
+			{Event: &remoteagent.RemoteEvent{
+				Type:      remoteagent.RemoteEventTaskArtifactUpdate,
+				TaskID:    "task-1",
+				Parts:     []remoteagent.RemotePart{{Text: "According "}},
+				Append:    true,
+				LastChunk: false,
+			}},
+			{Event: &remoteagent.RemoteEvent{
+				Type:      remoteagent.RemoteEventTaskArtifactUpdate,
+				TaskID:    "task-1",
+				Parts:     []remoteagent.RemotePart{{Text: "to the "}},
+				Append:    true,
+				LastChunk: false,
+			}},
+			{Event: &remoteagent.RemoteEvent{
+				Type:      remoteagent.RemoteEventTaskArtifactUpdate,
+				TaskID:    "task-1",
+				Parts:     []remoteagent.RemotePart{{Text: "latest data, "}},
+				Append:    true,
+				LastChunk: false,
+			}},
+			{Event: &remoteagent.RemoteEvent{
+				Type:      remoteagent.RemoteEventTaskArtifactUpdate,
+				TaskID:    "task-1",
+				Parts:     []remoteagent.RemotePart{{Text: "the capital is Tokyo."}},
+				Append:    true,
+				LastChunk: true,
+			}},
+			// Terminal status.
+			{Event: &remoteagent.RemoteEvent{
+				Type:   remoteagent.RemoteEventTaskStatusUpdate,
+				TaskID: "task-1",
+				State:  remoteagent.TaskStateCompleted,
+			}},
+		},
+	}
+
+	remoteAgent, err := remoteagent.NewRemoteAgent(remoteagent.RemoteAgentConfig{
+		Name:        "kb-agent",
+		Description: "Remote knowledge base bridge",
+		AgentCard:   fakeCfg.Card,
+		ClientProvider: func(card remoteagent.AgentCard) (remoteagent.A2AClient, error) {
+			return remoteagent.NewFakeA2AClient(fakeCfg), nil
+		},
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create remote agent: %v\n", err)
+		return 1
+	}
+
+	sessionSvc := runner.NewInMemorySessionService()
+	r, err := runner.New(runner.Config{
+		AppName:        "demo_a2a",
+		Agent:          remoteAgent,
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create runner: %v\n", err)
+		return 1
+	}
+
+	_, events, err := r.Run(stdctx.Background(), "user-1", "sess-a2a", "What is the capital?")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Run error: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("  %d raw events → aggregated into non-partial events:\n", 5)
+	for _, ev := range events {
+		text := ""
+		if ev.Content != nil && len(ev.Content.Parts) > 0 {
+			text = ev.Content.Parts[0].Text
+		}
+		partial := ""
+		if ev.Partial {
+			partial = " [PARTIAL-suppressed]"
+		}
+		status := ""
+		if ev.Actions.StateDelta != nil {
+			if s, ok := ev.Actions.StateDelta["remote_task_state"]; ok {
+				status = fmt.Sprintf(" [status=%v]", s)
+			}
+		}
+		if text != "" || status != "" {
+			fmt.Printf("    %q%s%s\n", truncate(text, 60), partial, status)
+		}
+	}
+	fmt.Println("  => Partial chunks are aggregated into complete events; terminal status flushes all.")
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo agent helpers for Chapter 05
+// ---------------------------------------------------------------------------
+
+// newDemoAgent creates an LLM-backed demo sub-agent from a text response.
+func newDemoAgent(name, desc string, responses ...*model.LLMResponse) workflow.SubAgent {
+	f := &flow.Flow{Model: model.NewFakeModel("fake-"+name, responses...)}
+	a, _ := llmagent.New(name, desc, f)
+	return a.(workflow.SubAgent)
+}
+
+// newRawDemoAgent creates a sub-agent from a raw run function (for escalate demos).
+func newRawDemoAgent(name, desc string, runFn func(ctx agent.InvocationContext) ([]*event.Event, error)) workflow.SubAgent {
+	a, _ := agent.New(agent.Config{
+		Name:        name,
+		Description: desc,
+		Run:         runFn,
+	})
+	return a
 }
