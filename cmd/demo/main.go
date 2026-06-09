@@ -27,12 +27,14 @@ import (
 	"strings"
 
 	"github.com/likun666661/rive-adk-go/artifact"
+	"github.com/likun666661/rive-adk-go/callbackctx"
 	invctx "github.com/likun666661/rive-adk-go/context"
 	"github.com/likun666661/rive-adk-go/event"
 	"github.com/likun666661/rive-adk-go/flow"
 	"github.com/likun666661/rive-adk-go/llmagent"
 	"github.com/likun666661/rive-adk-go/memory"
 	"github.com/likun666661/rive-adk-go/model"
+	"github.com/likun666661/rive-adk-go/plugin"
 	"github.com/likun666661/rive-adk-go/runner"
 	"github.com/likun666661/rive-adk-go/tool"
 )
@@ -56,6 +58,11 @@ func run() int {
 	fmt.Println()
 
 	if code := runChapter03(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := runChapter04(); code != 0 {
 		return code
 	}
 
@@ -753,6 +760,418 @@ func demoLongRunningTool() int {
 	fmt.Printf("  Result: job_id=%v, status=%v\n", result["job_id"], result["status"])
 	fmt.Println("  => Long-running tool returns job metadata; LLM is warned not to repeat calls.")
 
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Chapter 04 — callback / plugin / instruction integration
+// ---------------------------------------------------------------------------
+
+func runChapter04() int {
+	fmt.Println("--- Chapter 04: Callback / Plugin / Instruction Integration ---")
+	fmt.Println()
+
+	if code := demoPluginLogging(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := demoBeforeModelCache(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := demoInstructionInterpolation(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := demoPluginOrdering(); code != 0 {
+		return code
+	}
+
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 4.1 — Plugin logging / observability
+// ---------------------------------------------------------------------------
+
+func demoPluginLogging() int {
+	fmt.Println("[Demo 4.1] Plugin Logging / Observability")
+
+	var logLines []string
+	logPrefix := func(stage string) func(format string, args ...any) {
+		return func(format string, args ...any) {
+			msg := fmt.Sprintf(format, args...)
+			logLines = append(logLines, fmt.Sprintf("[%s] %s", stage, msg))
+		}
+	}
+
+	logBeforeModel := logPrefix("before-model")
+	logAfterModel := logPrefix("after-model")
+	logBeforeTool := logPrefix("before-tool")
+	logAfterTool := logPrefix("after-tool")
+
+	mgr := plugin.NewManager()
+	mgr.Register(plugin.New(plugin.Config{
+		Name: "logging-plugin",
+		BeforeModel: func(ctx callbackctx.CallbackContext, req *model.LLMRequest) (*model.LLMResponse, error) {
+			logBeforeModel("model=%q instructions=%q", req.Model, truncate(req.SystemInstruction, 50))
+			return nil, nil
+		},
+		AfterModel: func(ctx callbackctx.CallbackContext, req *model.LLMRequest, resp *model.LLMResponse, callErr error) (*model.LLMResponse, error) {
+			if resp != nil && resp.Content != nil && len(resp.Content.Parts) > 0 {
+				logAfterModel("response_text=%q", truncate(resp.Content.Parts[0].Text, 50))
+			}
+			return nil, nil
+		},
+		BeforeTool: func(ctx callbackctx.ToolContext, toolName string, args map[string]any) (map[string]any, error) {
+			logBeforeTool("tool=%q args=%v", toolName, args)
+			return nil, nil
+		},
+		AfterTool: func(ctx callbackctx.ToolContext, toolName string, args, result map[string]any, runErr error) (map[string]any, error) {
+			if runErr != nil {
+				logAfterTool("tool=%q error=%v", toolName, runErr)
+			} else {
+				logAfterTool("tool=%q result=%v", toolName, result)
+			}
+			return nil, nil
+		},
+	}))
+
+	echoTool := tool.NewFunctionTool("echo", "Echo back the message",
+		func(args map[string]any) (map[string]any, error) {
+			msg, _ := args["msg"].(string)
+			return map[string]any{"echo": msg}, nil
+		},
+	)
+
+	f := &flow.Flow{
+		Model: model.NewFakeModel("demo-model",
+			model.FunctionCallResponse("Let me echo that.",
+				event.FunctionCall{ID: "fc-echo", Name: "echo", Args: map[string]any{"msg": "hello world"}},
+			),
+			model.TextResponse("I've echoed your message."),
+		),
+		Tools: map[string]tool.FunctionTool{
+			"echo": echoTool,
+		},
+		PluginManager: mgr,
+	}
+
+	ag, err := llmagent.New("log_demo_agent", "A bot with logging plugin.", f)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create agent: %v\n", err)
+		return 1
+	}
+
+	sessionSvc := runner.NewInMemorySessionService()
+	r, err := runner.New(runner.Config{
+		AppName:        "log_app",
+		Agent:          ag.(runner.ExecutableAgent),
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create runner: %v\n", err)
+		return 1
+	}
+
+	_, _, err = r.Run(stdctx.Background(), "user-1", "sess-log", "Echo 'hello world'")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Run error: %v\n", err)
+		return 1
+	}
+
+	for _, line := range logLines {
+		fmt.Printf("  %s\n", line)
+	}
+	fmt.Printf("  => Logging plugin captured %d events (pure observer, no control flow change).\n", len(logLines))
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 4.2 — Before-model cache / mock response early-exit
+// ---------------------------------------------------------------------------
+
+func demoBeforeModelCache() int {
+	fmt.Println("[Demo 4.2] Before-Model Cache / Mock Response Early-Exit")
+
+	cache := map[string]string{
+		"What's the weather?": "The weather is sunny and 22°C (cached).",
+	}
+
+	mgr := plugin.NewManager()
+	mgr.Register(plugin.New(plugin.Config{
+		Name: "cache-plugin",
+		BeforeModel: func(ctx callbackctx.CallbackContext, req *model.LLMRequest) (*model.LLMResponse, error) {
+			userMsg := ctx.UserContent()
+			if cached, ok := cache[userMsg]; ok {
+				return model.TextResponse(cached), nil
+			}
+			return nil, nil
+		},
+	}))
+
+	weatherTool := tool.NewFunctionTool("get_weather", "Get weather",
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"temp": 22, "condition": "sunny"}, nil
+		},
+	)
+
+	f := &flow.Flow{
+		Model: model.NewFakeModel("demo-model",
+			model.FunctionCallResponse("Let me check weather.",
+				event.FunctionCall{ID: "fc1", Name: "get_weather", Args: map[string]any{"city": "Tokyo"}},
+			),
+			model.TextResponse("Tokyo is 22°C and sunny."),
+		),
+		Tools: map[string]tool.FunctionTool{
+			"get_weather": weatherTool,
+		},
+		PluginManager: mgr,
+	}
+
+	ag, err := llmagent.New("cache_agent", "A bot with cache plugin.", f)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create agent: %v\n", err)
+		return 1
+	}
+
+	sessionSvc := runner.NewInMemorySessionService()
+	r, err := runner.New(runner.Config{
+		AppName:        "cache_app",
+		Agent:          ag.(runner.ExecutableAgent),
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create runner: %v\n", err)
+		return 1
+	}
+
+	_, events, err := r.Run(stdctx.Background(), "user-1", "sess-cache", "What's the weather?")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Run error: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("  Events produced: %d\n", len(events))
+	for _, ev := range events {
+		if ev.Content != nil {
+			for _, p := range ev.Content.Parts {
+				if p.Text != "" {
+					fmt.Printf("  Model response: %q\n", p.Text)
+				}
+			}
+		}
+	}
+	fmt.Println("  => Cache plugin returned a mock response before LLM was called (early exit).")
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 4.3 — Callback state mutation and instruction interpolation
+// ---------------------------------------------------------------------------
+
+func demoInstructionInterpolation() int {
+	fmt.Println("[Demo 4.3] Callback State Mutation & Instruction Interpolation")
+
+	var capturedInstruction string
+	var capturedState map[string]any
+
+	f := &flow.Flow{
+		Model: model.NewFakeModel("demo-model",
+			model.TextResponse("Hello Alice! I'll help you with data analysis as an admin."),
+		),
+		// A request processor that builds a system instruction from session state.
+		RequestProcessors: []flow.RequestProcessor{
+			func(ic invctx.InvocationContext, req *model.LLMRequest) (*event.Event, error) {
+				name := ""
+				role := ""
+				task := ""
+
+				if v, ok := ic.Session().State().Get("user_name"); ok {
+					name = fmt.Sprintf("%v", v)
+				}
+				if v, ok := ic.Session().State().Get("user_role"); ok {
+					role = fmt.Sprintf("%v", v)
+				}
+				if v, ok := ic.Session().State().Get("current_task"); ok {
+					task = fmt.Sprintf("%v", v)
+				}
+
+				req.SystemInstruction = fmt.Sprintf(
+					"You are assisting %s. Their role is %s. Current task: %s.",
+					name, role, task,
+				)
+				capturedInstruction = req.SystemInstruction
+				capturedState = ic.Session().State().All()
+				return nil, nil
+			},
+		},
+	}
+
+	ag, err := llmagent.New("instruction_agent", "A bot with instruction interpolation.", f)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create agent: %v\n", err)
+		return 1
+	}
+
+	sessionSvc := runner.NewInMemorySessionService()
+	_, err = runner.New(runner.Config{
+		AppName:        "instr_app",
+		Agent:          ag.(runner.ExecutableAgent),
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create runner: %v\n", err)
+		return 1
+	}
+
+	// Pre-populate session state before running (simulating plugin/callback state mutation).
+	sess, err := sessionSvc.Create(stdctx.Background(), "instr_app", "user-1", "sess-instr")
+	if err != nil {
+		sess, _ = sessionSvc.Get(stdctx.Background(), "instr_app", "user-1", "sess-instr")
+	}
+	sess.State().Set("user_name", "Alice")
+	sess.State().Set("user_role", "admin")
+	sess.State().Set("current_task", "data analysis")
+
+	// Use manual Run to show the captured instruction.
+	nextOrdinal := sess.EventCount() + 1
+	invocationID := fmt.Sprintf("%s-inv-%d", sess.ID(), nextOrdinal)
+	userEvent := event.NewEvent(
+		fmt.Sprintf("%s-user-%d", sess.ID(), nextOrdinal),
+		"user",
+		event.RoleUser,
+	)
+	userEvent.Branch = ag.Name()
+	userEvent.Content = &event.Content{
+		Role: event.RoleUser,
+		Parts: []event.Part{
+			{Text: "Help me with data analysis"},
+		},
+	}
+	sess.AppendEvent(userEvent)
+
+	ic := invctx.NewInvocationContext(invctx.Params{
+		Ctx:          stdctx.Background(),
+		Agent:        ag,
+		Session:      sess,
+		InvocationID: invocationID,
+		Branch:       ag.Name(),
+		UserContent:  "Help me with data analysis",
+	})
+
+	events, err := ag.(runner.ExecutableAgent).Execute(ic)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Execute error: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("  Session state keys: ")
+	for k := range capturedState {
+		fmt.Printf("%s ", k)
+	}
+	fmt.Println()
+	fmt.Printf("  Captured system instruction: %q\n", capturedInstruction)
+
+	for _, ev := range events {
+		if ev.Content != nil {
+			for _, p := range ev.Content.Parts {
+				if p.Text != "" {
+					fmt.Printf("  Model response: %q\n", p.Text)
+				}
+			}
+		}
+	}
+	fmt.Println("  => Instruction was interpolated from session state before LLM call.")
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 4.4 — Plugin ordering relative to direct callbacks
+// ---------------------------------------------------------------------------
+
+func demoPluginOrdering() int {
+	fmt.Println("[Demo 4.4] Plugin Ordering Relative to Direct Callbacks")
+
+	var executionOrder []string
+	record := func(name string) {
+		executionOrder = append(executionOrder, name)
+	}
+
+	mgr := plugin.NewManager()
+	mgr.Register(plugin.New(plugin.Config{
+		Name: "plugin-a",
+		BeforeModel: func(ctx callbackctx.CallbackContext, req *model.LLMRequest) (*model.LLMResponse, error) {
+			record("plugin-a:beforeModel")
+			return nil, nil
+		},
+		AfterModel: func(ctx callbackctx.CallbackContext, req *model.LLMRequest, resp *model.LLMResponse, callErr error) (*model.LLMResponse, error) {
+			record("plugin-a:afterModel")
+			return nil, nil
+		},
+	}))
+	mgr.Register(plugin.New(plugin.Config{
+		Name: "plugin-b",
+		BeforeModel: func(ctx callbackctx.CallbackContext, req *model.LLMRequest) (*model.LLMResponse, error) {
+			record("plugin-b:beforeModel")
+			return nil, nil
+		},
+		AfterModel: func(ctx callbackctx.CallbackContext, req *model.LLMRequest, resp *model.LLMResponse, callErr error) (*model.LLMResponse, error) {
+			record("plugin-b:afterModel")
+			return nil, nil
+		},
+	}))
+
+	f := &flow.Flow{
+		Model: model.NewFakeModel("demo-model",
+			model.TextResponse("Ordering confirmed."),
+		),
+		BeforeModelCallbacks: []flow.BeforeModelCallback{
+			func(ctx invctx.InvocationContext, req *model.LLMRequest) (*model.LLMResponse, error) {
+				record("direct:beforeModel-1")
+				return nil, nil
+			},
+		},
+		AfterModelCallbacks: []flow.AfterModelCallback{
+			func(ctx invctx.InvocationContext, req *model.LLMRequest, resp *model.LLMResponse, callErr error) (*model.LLMResponse, error) {
+				record("direct:afterModel-1")
+				return nil, nil
+			},
+		},
+		PluginManager: mgr,
+	}
+
+	ag, err := llmagent.New("order_agent", "A bot demonstrating hook ordering.", f)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create agent: %v\n", err)
+		return 1
+	}
+
+	sessionSvc := runner.NewInMemorySessionService()
+	r, err := runner.New(runner.Config{
+		AppName:        "order_app",
+		Agent:          ag.(runner.ExecutableAgent),
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create runner: %v\n", err)
+		return 1
+	}
+
+	_, _, err = r.Run(stdctx.Background(), "user-1", "sess-order", "Show ordering")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Run error: %v\n", err)
+		return 1
+	}
+
+	fmt.Println("  Execution order (before model):")
+	for _, step := range executionOrder {
+		fmt.Printf("    %s\n", step)
+	}
+	fmt.Println("  => Plugins always run before direct callbacks (Chapter 04 teaching model).")
 	return 0
 }
 

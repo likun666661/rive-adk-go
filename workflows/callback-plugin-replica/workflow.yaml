@@ -1,0 +1,115 @@
+api_version: rive.workflow/v0
+id: rive-adk-go.callback-plugin-replica
+version: 1
+title: Rive ADK Go callback and plugin replica
+params:
+  repo_path:
+    type: string
+    required: true
+  chapter_path:
+    type: string
+    required: true
+  source_repo:
+    type: string
+    required: true
+nodes:
+  extend-callback-context-actions:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-a
+    acceptance_mode: auto-reported
+    title: Extend callback context and event actions
+    prompt:
+      file: prompts/01-extend-callback-context-actions.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  implement-plugin-manager-hooks:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-b
+    acceptance_mode: auto-reported
+    title: Implement plugin manager and hook ordering
+    consumes:
+      - extend-callback-context-actions
+    prompt:
+      file: prompts/02-implement-plugin-manager-hooks.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  integrate-instruction-processors-demo:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-c
+    acceptance_mode: auto-reported
+    title: Integrate instruction processors, docs, and demo
+    consumes:
+      - extend-callback-context-actions
+      - implement-plugin-manager-hooks
+    prompt:
+      file: prompts/03-integrate-instruction-processors-demo.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  codex-final-merge-callback-plugin:
+    kind: review
+    runner: codex
+    worker: codex-runtime-steward
+    acceptance_mode: auto-reported
+    title: Codex final review, fixes, verification, and commit
+    consumes:
+      - extend-callback-context-actions
+      - implement-plugin-manager-hooks
+      - integrate-instruction-processors-demo
+    prompt:
+      file: prompts/04-codex-final-merge-callback-plugin.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - review_findings
+        - fixes
+        - verification
+        - commit
+edges:
+  - type: decomposes_to
+    from: root
+    to: extend-callback-context-actions
+  - type: decomposes_to
+    from: root
+    to: implement-plugin-manager-hooks
+  - type: decomposes_to
+    from: root
+    to: integrate-instruction-processors-demo
+  - type: decomposes_to
+    from: root
+    to: codex-final-merge-callback-plugin
+  - type: depends_on
+    from: implement-plugin-manager-hooks
+    to: extend-callback-context-actions
+  - type: depends_on
+    from: integrate-instruction-processors-demo
+    to: extend-callback-context-actions
+  - type: depends_on
+    from: integrate-instruction-processors-demo
+    to: implement-plugin-manager-hooks
+  - type: depends_on
+    from: codex-final-merge-callback-plugin
+    to: extend-callback-context-actions
+  - type: depends_on
+    from: codex-final-merge-callback-plugin
+    to: implement-plugin-manager-hooks
+  - type: depends_on
+    from: codex-final-merge-callback-plugin
+    to: integrate-instruction-processors-demo

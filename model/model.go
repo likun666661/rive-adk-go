@@ -14,9 +14,10 @@ import (
 
 // LLMRequest is the request sent to a model.
 type LLMRequest struct {
-	Model            string
-	Contents         []LLMContent
-	ToolDeclarations []any
+	Model             string
+	SystemInstruction string
+	Contents          []LLMContent
+	ToolDeclarations  []any
 }
 
 // LLMContent represents a single message in the conversation history.

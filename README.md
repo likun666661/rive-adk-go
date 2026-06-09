@@ -222,9 +222,10 @@ sess-2 sees: app:env=prod, user:theme=dark (but NOT topic — session-scoped)
 - **No external backends**: only in-memory implementations are provided. The
   service interfaces are public, enabling swap-in of GCS, SQL, or Vertex AI
   backends.
-- **ArtifactDelta tracking**: `EventActions.ArtifactDelta` is defined but not
-  consumed during `AppendEvent`. Artifact saves are explicit calls through the
-  service, not automatic side-effects of event processing.
+- **ArtifactDelta tracking**: callback contexts record artifact saves in
+  `EventActions.ArtifactDelta`. `AppendEvent` persists the event metadata but
+  does not replay artifact writes; artifact content is saved explicitly through
+  the artifact service.
 - **Memory session overwrite**: calling `AddSessionToMemory` twice for the same
   session replaces all entries (not incremental append). This matches the
   upstream in-memory behavior.
@@ -241,7 +242,7 @@ runtime intentionally omits:
 | Database session backend (GORM/SQLite) | Educational scope; the in-memory service demonstrates the full state routing logic |
 | Vertex AI session and memory backends | Requires cloud credentials and external services |
 | GCS artifact backend | Requires cloud credentials; in-memory covers all API semantics |
-| `ArtifactDelta` auto-tracking in callbacks | Callback context injection is an internal ADK Go detail not needed for the simplified model |
+| Automatic artifact replay from events | Artifact content is saved through the artifact service; events only record `ArtifactDelta` metadata |
 | Stale session detection (microsecond timestamps) | No multi-writer scenario in this runtime |
 | `SaveRequest.Version` for optimistic concurrency | The in-memory implementation ignores this field (consistent with upstream in-memory) |
 | Request-history reconstruction from session events | A separate concern not needed for this demo |
@@ -333,6 +334,136 @@ confirmation orchestration. This runtime intentionally omits:
 | MCP connection lifecycle | `connectionRefresher`, ping/lazy-connect/retry logic; out of scope for local tools |
 | `typeutil.ConvertToWithJSONSchema` | Go generics → JSON Schema inference is a separate infrastructure concern |
 | `toolutils.PackTool` | Merging declarations into `genai.Tool` structure; our `InjectDeclarations` fills the same role for `LLMRequest.ToolDeclarations` |
+
+---
+
+## Chapter 04: Callback / Plugin / Instruction Integration
+
+### Why Three Extension Layers Exist
+
+The agent runtime needs cross-cutting extension points for observability, flow
+control, request rewriting, error recovery, and state management. Without
+unified hooks, each feature would require invasive changes to core logic.
+
+Three layers serve distinct purposes:
+
+| Layer | Role | Key Types |
+|-------|------|-----------|
+| **Instruction (Processor)** | Inject system instructions before each LLM call using static templates, dynamic providers, and `{placeholder}` injection from session state | `instruction.Config`, `instruction.Provider`, `InjectSessionState` |
+| **Callback** | Direct hooks on flow events (before/after model, before/after tool) registered on individual agents, with optional `CallbackContext` state/action tracking | `flow.BeforeModelCallbackCtx`, `flow.AfterModelCallbackCtx`, `flow.BeforeToolCallbackCtx`, `flow.AfterToolCallbackCtx` |
+| **Plugin** | Composable, named, ordered hook bundles registered on a `plugin.Manager` that runs before direct callbacks | `plugin.Plugin`, `plugin.Manager`, `Plugin.BeforeModelCallback()`, etc. |
+
+### Instruction Processors
+
+**Static instruction** — a literal string in agent configuration:
+
+```go
+cfg := instruction.Config{
+    Instruction: "You are a helpful assistant for {topic}.",
+}
+```
+
+**Dynamic instruction provider** — a function called at each LLM request:
+
+```go
+cfg.InstructionProvider = func(ctx instruction.ReadonlyContext) (string, error) {
+    return "Current user: " + ctx.UserID(), nil
+}
+```
+
+**Global instruction + provider** — applied only for root agents:
+
+```go
+cfg.GlobalInstruction = "Safety rules apply to all agents."
+cfg.GlobalInstructionProvider = globalRulesProvider
+cfg.IsRootAgent = func() bool { return true }
+```
+
+**`{placeholder}` injection** — resolve `{key}`, `{app:key}`, `{user:key}`,
+`{temp:key}`, and optional `{key?}` patterns from the merged session state:
+
+```go
+injected, err := instruction.InjectSessionState(
+    "User {user:name} is working on {task}.", mergedState)
+```
+
+Wire into the flow as a `RequestProcessor`:
+
+```go
+f.RequestProcessors = []flow.RequestProcessor{
+    instruction.ToRequestProcessor(instruction.NewRequestProcessor(cfg)),
+}
+```
+
+### Plugin Layer
+
+Plugins compose multiple hook types into a named, orderable unit. The
+`plugin.Manager` runs plugin hooks before direct callbacks (Chapter 04
+teaching model).
+
+**Hook execution semantics:**
+- **Registration order** — first registered runs first.
+- **Nil skip** — hooks a plugin doesn't implement are silently skipped.
+- **Early exit** — first non-nil result short-circuits the remaining chain.
+- **Immediate error** — any hook error aborts the entire chain.
+
+**Plugin vs Callback:**
+
+| Dimension | Callback | Plugin |
+|-----------|----------|--------|
+| Installation | Directly in `Flow` struct fields | Through `PluginManager.Register()` |
+| Lifecycle | Bound to agent/flow instance | Global; shareable across agents |
+| Hook coverage | Model/Tool level | Model/Tool/Agent level |
+| Composability | Static lists | Ordered dynamic list |
+| Use case | Single-agent customization | Cross-agent concerns (logging, caching, retry) |
+
+### What This Replica Implements
+
+| Feature | Implementation |
+|---------|---------------|
+| Static instruction | `instruction.Config.Instruction` |
+| Dynamic instruction provider | `instruction.Provider` with `ReadonlyContext` |
+| Global instruction (root-only) | `instruction.Config.GlobalInstruction` + `IsRootAgent` |
+| Global instruction provider (root-only) | `instruction.Config.GlobalInstructionProvider` |
+| `{placeholder}` injection | `instruction.InjectSessionState` — regex-based, supports `{key}`, `{key?}`, `{app:key}`, `{user:key}`, `{temp:key}` |
+| Flow integration | `instruction.ToRequestProcessor` adapts to `flow.RequestProcessor` |
+| `LLMRequest.SystemInstruction` | New field on `model.LLMRequest` |
+| Plugin Manager | `plugin.Manager` with ordered execution + early exit |
+| Plugin hooks | Before/After agent, model, tool + OnError hooks |
+| Callback context | `callbackctx.CallbackContext` / `ToolContext` expose readonly identity, write-through state, artifact tracking, and action access |
+| Event action deltas | Callback state writes surface on emitted model/tool events through `StateDelta`; callback artifact saves surface through `ArtifactDelta` |
+| Plugin before direct callbacks | Flow runs plugin hooks before context-aware direct callbacks and legacy direct callbacks |
+| Plugin logging demo | `demoPluginLogging` — pure observer, all hooks |
+| Before-model cache/mock | `demoBeforeModelCache` — early exit from cache |
+| Instruction interpolation | `demoInstructionInterpolation` — state → instruction |
+| Plugin/callback ordering | `demoPluginOrdering` — plugins before callbacks |
+
+### Why Hook Ordering and Early-Exit Matter
+
+1. **Observability plugins must run first** — a logging plugin registered first
+   should see the request before other plugins modify it.
+2. **Cache plugins must run before the LLM call** — returning a cached
+   `LLMResponse` from `BeforeModelCallback` short-circuits the expensive API
+   call (early exit).
+3. **State mutation in callbacks** — a `BeforeAgentCallback` writing to session
+   state is visible to subsequent `RequestProcessor` running in `preprocess`,
+   enabling instruction interpolation from dynamically set state.
+4. **Error recovery chain** — `OnModelError` hooks can replace errors with
+   recovery responses, but only if they run in the correct order.
+
+### Intentional Omissions
+
+| Omission | Reason |
+|----------|--------|
+| Real telemetry exporters (OTLP, Prometheus) | Educational scope; the logging plugin demonstrates the pure observer pattern |
+| Auth plugins (OAuth, API key injection) | Requires external auth services |
+| Full ADK plugin API compatibility | This replica defines its own minimal Plugin/Manager types |
+| `Plugin.Close()` with timeout | Close is synchronous with no timeout; adequate for in-process plugins |
+| Plugin priority/dependency declarations | Priority is registration order only; no explicit dependency graph |
+| Agent-level plugin hooks in the standard `runner.Run` path | `BeforeAgent`/`AfterAgent` are available through `context.RunWithCallbackContext`; the existing Chapter 01-03 `agent.Execute` path remains unchanged |
+| `RetryAndReflect` plugin | The retry loop requires multi-turn LLM coordination; the before-model cache demo covers the early-exit pattern |
+| Configurable layer (YAML → plugin wiring) | Plugins are registered programmatically; YAML mapping is deferred |
+| `FunctionCallModifier` (tool schema rewriting) | The `InjectDeclarations` mechanism in flow serves a similar purpose for tool declaration injection |
 
 ```bash
 go test ./...

@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/likun666661/rive-adk-go/event"
 	"github.com/likun666661/rive-adk-go/model"
 )
 
@@ -135,10 +136,11 @@ func NewLongRunningFunctionTool(name, description string, decl Declaration, run 
 
 // CallResult captures the result of executing a single tool call.
 type CallResult struct {
-	CallID string
-	Name   string
-	Result map[string]any
-	Error  string
+	CallID  string
+	Name    string
+	Result  map[string]any
+	Error   string
+	Actions event.EventActions
 }
 
 // Execute runs a single tool call and returns a structured result.

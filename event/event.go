@@ -69,6 +69,11 @@ type EventActions struct {
 	// StateDelta is a map of key->value pairs to merge into session state.
 	StateDelta map[string]any `json:"stateDelta,omitempty"`
 
+	// ArtifactDelta records filename→version changes produced during
+	// callback artifact saves. Each entry records the version returned
+	// by the artifact service after a successful Save.
+	ArtifactDelta map[string]int64 `json:"artifactDelta,omitempty"`
+
 	// TransferToAgent signals that execution should hand over to a different agent.
 	// TODO: later node — implement agent transfer resolution in runner/flow.
 	TransferToAgent string `json:"transferToAgent,omitempty"`

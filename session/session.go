@@ -49,6 +49,23 @@ type ReadonlyState interface {
 	All() map[string]any
 }
 
+// NewReadonlyState wraps a writable State and returns a read-only view.
+func NewReadonlyState(s State) ReadonlyState {
+	return &readonlyStateWrapper{state: s}
+}
+
+type readonlyStateWrapper struct {
+	state State
+}
+
+func (r *readonlyStateWrapper) Get(key string) (any, bool) {
+	return r.state.Get(key)
+}
+
+func (r *readonlyStateWrapper) All() map[string]any {
+	return r.state.All()
+}
+
 type stateImpl struct {
 	mu   sync.RWMutex
 	data map[string]any

@@ -11,12 +11,26 @@
 //
 // Callbacks can return content to shortcut execution (early exit),
 // produce side effects (state delta only), or return errors.
+//
+// Two callback flavours are supported:
+//
+//   - Legacy: BeforeAgentCallback / AfterAgentCallback accepting
+//     InvocationContext (preserved for Chapter 01‑03 compatibility).
+//   - Context‑aware: BeforeAgentCallbackCtx / AfterAgentCallbackCtx
+//     accepting callbackctx.CallbackContext, providing write‑through state
+//     with delta recording, artifact tracking, and readonly identity
+//     information.
+//
+// Use context.RunWithCallbackContext to execute agents with the
+// CallbackContext‑aware lifecycle.
 package agent
 
 import (
 	"fmt"
 
+	"github.com/likun666661/rive-adk-go/callbackctx"
 	"github.com/likun666661/rive-adk-go/event"
+	"github.com/likun666661/rive-adk-go/plugin"
 )
 
 // Agent is the base interface that all agents must implement.
@@ -46,10 +60,21 @@ type BeforeAgentCallback func(ctx InvocationContext) (*event.Event, error)
 // The events parameter contains all events produced by Run.
 type AfterAgentCallback func(ctx InvocationContext, events []*event.Event) (*event.Event, error)
 
+// BeforeAgentCallbackCtx is a context‑aware before‑agent callback.
+// It receives a full CallbackContext, enabling:
+//   - State reads/writes with delta recording (State()).
+//   - Artifact save tracking (ArtifactService() saves are auto‑recorded).
+//   - Readonly identity/session/user/app/branch information.
+type BeforeAgentCallbackCtx func(ctx callbackctx.CallbackContext) (*event.Event, error)
+
+// AfterAgentCallbackCtx is a context‑aware after‑agent callback.
+type AfterAgentCallbackCtx func(ctx callbackctx.CallbackContext, events []*event.Event) (*event.Event, error)
+
 // Config configures a new Agent.
 type Config struct {
 	Name                 string
 	Description          string
+	PluginManager        *plugin.Manager
 	BeforeAgentCallbacks []BeforeAgentCallback
 	AfterAgentCallbacks  []AfterAgentCallback
 	Run                  func(ctx InvocationContext) ([]*event.Event, error)
@@ -59,6 +84,7 @@ type Config struct {
 type baseAgent struct {
 	name                 string
 	description          string
+	pluginManager        *plugin.Manager
 	beforeAgentCallbacks []BeforeAgentCallback
 	afterAgentCallbacks  []AfterAgentCallback
 	run                  func(ctx InvocationContext) ([]*event.Event, error)
@@ -66,6 +92,9 @@ type baseAgent struct {
 
 func (a *baseAgent) Name() string        { return a.name }
 func (a *baseAgent) Description() string { return a.description }
+
+// PluginManager returns the agent's plugin manager, or nil.
+func (a *baseAgent) PluginManager() *plugin.Manager { return a.pluginManager }
 
 // Execute runs the full lifecycle: before callbacks → run → after callbacks.
 // It returns all events produced and the last error encountered.
@@ -106,6 +135,24 @@ func (a *baseAgent) Execute(ctx InvocationContext) ([]*event.Event, error) {
 	return allEvents, nil
 }
 
+// New creates an Agent from a Config.
+func New(cfg Config) (*baseAgent, error) {
+	if cfg.Name == "" {
+		return nil, fmt.Errorf("agent: name is required")
+	}
+	if cfg.Run == nil {
+		return nil, fmt.Errorf("agent: run function is required")
+	}
+	return &baseAgent{
+		name:                 cfg.Name,
+		description:          cfg.Description,
+		pluginManager:        cfg.PluginManager,
+		beforeAgentCallbacks: cfg.BeforeAgentCallbacks,
+		afterAgentCallbacks:  cfg.AfterAgentCallbacks,
+		run:                  cfg.Run,
+	}, nil
+}
+
 func runBeforeCallbacks(ctx InvocationContext, cbs []BeforeAgentCallback) (*event.Event, error) {
 	for i, cb := range cbs {
 		if cb == nil {
@@ -136,21 +183,4 @@ func runAfterCallbacks(ctx InvocationContext, events []*event.Event, cbs []After
 		}
 	}
 	return nil, nil
-}
-
-// New creates an Agent from a Config.
-func New(cfg Config) (*baseAgent, error) {
-	if cfg.Name == "" {
-		return nil, fmt.Errorf("agent: name is required")
-	}
-	if cfg.Run == nil {
-		return nil, fmt.Errorf("agent: run function is required")
-	}
-	return &baseAgent{
-		name:                 cfg.Name,
-		description:          cfg.Description,
-		beforeAgentCallbacks: cfg.BeforeAgentCallbacks,
-		afterAgentCallbacks:  cfg.AfterAgentCallbacks,
-		run:                  cfg.Run,
-	}, nil
 }

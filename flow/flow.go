@@ -21,9 +21,11 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/likun666661/rive-adk-go/callbackctx"
 	"github.com/likun666661/rive-adk-go/context"
 	"github.com/likun666661/rive-adk-go/event"
 	"github.com/likun666661/rive-adk-go/model"
+	"github.com/likun666661/rive-adk-go/plugin"
 	"github.com/likun666661/rive-adk-go/session"
 	"github.com/likun666661/rive-adk-go/tool"
 )
@@ -49,17 +51,36 @@ type BeforeToolCallback func(ctx context.InvocationContext, toolName string, arg
 // AfterToolCallback is invoked after a single tool executes.
 type AfterToolCallback func(ctx context.InvocationContext, toolName string, args, result map[string]any, runErr error) (map[string]any, error)
 
+// BeforeModelCallbackCtx is a context‑aware before‑model callback.
+type BeforeModelCallbackCtx func(ctx callbackctx.CallbackContext, req *model.LLMRequest) (*model.LLMResponse, error)
+
+// AfterModelCallbackCtx is a context‑aware after‑model callback.
+type AfterModelCallbackCtx func(ctx callbackctx.CallbackContext, req *model.LLMRequest, resp *model.LLMResponse, callErr error) (*model.LLMResponse, error)
+
+// BeforeToolCallbackCtx is a context‑aware before‑tool callback.
+type BeforeToolCallbackCtx func(ctx callbackctx.ToolContext, toolName string, args map[string]any) (map[string]any, error)
+
+// AfterToolCallbackCtx is a context‑aware after‑tool callback.
+type AfterToolCallbackCtx func(ctx callbackctx.ToolContext, toolName string, args, result map[string]any, runErr error) (map[string]any, error)
+
 // Flow orchestrates the model‑and‑tool execution loop for a single agent.
 type Flow struct {
 	Model                model.LLM
 	Tools                map[string]tool.FunctionTool
 	Toolsets             []tool.Toolset
+	PluginManager        *plugin.Manager
 	RequestProcessors    []RequestProcessor
 	ResponseProcessors   []ResponseProcessor
 	BeforeModelCallbacks []BeforeModelCallback
 	AfterModelCallbacks  []AfterModelCallback
 	BeforeToolCallbacks  []BeforeToolCallback
 	AfterToolCallbacks   []AfterToolCallback
+
+	// Context‑aware callback lists (record side effects via EventActions).
+	BeforeModelCallbacksCtx []BeforeModelCallbackCtx
+	AfterModelCallbacksCtx  []AfterModelCallbackCtx
+	BeforeToolCallbacksCtx  []BeforeToolCallbackCtx
+	AfterToolCallbacksCtx   []AfterToolCallbackCtx
 
 	resolvedTools    map[string]tool.Tool
 	resolvedToolList []tool.Tool
@@ -117,9 +138,10 @@ func (f *Flow) runOneStep(ctx context.InvocationContext, step int) ([]*event.Eve
 	f.injectToolDeclarations(req)
 
 	var resp *model.LLMResponse
+	modelActions := &event.EventActions{}
 	for {
 		var modelErr error
-		resp, modelErr = f.callModel(ctx, req)
+		resp, modelErr = f.callModel(ctx, req, modelActions)
 		if modelErr != nil {
 			return nil, modelErr
 		}
@@ -137,7 +159,7 @@ func (f *Flow) runOneStep(ctx context.InvocationContext, step int) ([]*event.Eve
 		break
 	}
 
-	modelEvent := f.finalizeModelResponseEvent(ctx, step, resp)
+	modelEvent := f.finalizeModelResponseEvent(ctx, step, resp, modelActions)
 	if modelEvent == nil {
 		return nil, nil
 	}
@@ -175,7 +197,26 @@ func (f *Flow) preprocess(ctx context.InvocationContext, req *model.LLMRequest) 
 	return nil, nil
 }
 
-func (f *Flow) callModel(ctx context.InvocationContext, req *model.LLMRequest) (*model.LLMResponse, error) {
+func (f *Flow) callModel(ctx context.InvocationContext, req *model.LLMRequest, actions *event.EventActions) (*model.LLMResponse, error) {
+	cctx := context.NewCallbackContextWithArtifactTracking(ctx, actions)
+
+	if f.PluginManager != nil {
+		resp, err := f.PluginManager.RunBeforeModelCallback(cctx, req)
+		if resp != nil || err != nil {
+			return resp, err
+		}
+	}
+
+	for _, cb := range f.BeforeModelCallbacksCtx {
+		if cb == nil {
+			continue
+		}
+		resp, err := cb(cctx, req)
+		if resp != nil || err != nil {
+			return resp, err
+		}
+	}
+
 	for _, cb := range f.BeforeModelCallbacks {
 		if cb == nil {
 			continue
@@ -187,6 +228,33 @@ func (f *Flow) callModel(ctx context.InvocationContext, req *model.LLMRequest) (
 	}
 
 	resp, err := f.Model.GenerateContent(req)
+
+	if err != nil && f.PluginManager != nil {
+		recoveryResp, recoveryErr := f.PluginManager.RunOnModelErrorCallback(cctx, req, err)
+		if recoveryResp != nil || recoveryErr != nil {
+			return recoveryResp, recoveryErr
+		}
+	}
+
+	if f.PluginManager != nil {
+		afterResp, afterErr := f.PluginManager.RunAfterModelCallback(cctx, req, resp, err)
+		if afterResp != nil || afterErr != nil {
+			resp = afterResp
+			err = afterErr
+		}
+	}
+
+	for _, cb := range f.AfterModelCallbacksCtx {
+		if cb == nil {
+			continue
+		}
+		overrideResp, overrideErr := cb(cctx, req, resp, err)
+		if overrideResp != nil || overrideErr != nil {
+			resp = overrideResp
+			err = overrideErr
+			break
+		}
+	}
 
 	for _, cb := range f.AfterModelCallbacks {
 		if cb == nil {
@@ -215,13 +283,14 @@ func (f *Flow) postprocess(ctx context.InvocationContext, req *model.LLMRequest,
 	return nil
 }
 
-func (f *Flow) finalizeModelResponseEvent(ctx context.InvocationContext, step int, resp *model.LLMResponse) *event.Event {
+func (f *Flow) finalizeModelResponseEvent(ctx context.InvocationContext, step int, resp *model.LLMResponse, actions *event.EventActions) *event.Event {
 	ev := event.NewEvent(
 		fmt.Sprintf("%s-step-%d", ctx.InvocationID(), step),
 		ctx.Agent().Name(),
 		event.RoleModel,
 	)
 	ev.Branch = ctx.Branch()
+	ev.Actions = compactEventActions(actions)
 
 	if resp.Content != nil {
 		content := &event.Content{
@@ -286,6 +355,43 @@ func (f *Flow) executeToolCall(ctx context.InvocationContext, fc *event.Function
 	if args == nil {
 		args = map[string]any{}
 	}
+	actions := &event.EventActions{}
+	tctx := context.NewToolContext(ctx, fc.ID, actions)
+
+	if f.PluginManager != nil {
+		result, err := f.PluginManager.RunBeforeToolCallback(tctx, fc.Name, args)
+		if result != nil || err != nil {
+			if err != nil {
+				return tool.CallResult{
+					CallID:  fc.ID,
+					Name:    fc.Name,
+					Result:  map[string]any{"error": err.Error()},
+					Error:   err.Error(),
+					Actions: compactEventActions(actions),
+				}
+			}
+			return tool.CallResult{CallID: fc.ID, Name: fc.Name, Result: result, Actions: compactEventActions(actions)}
+		}
+	}
+
+	for _, cb := range f.BeforeToolCallbacksCtx {
+		if cb == nil {
+			continue
+		}
+		result, err := cb(tctx, fc.Name, args)
+		if result != nil || err != nil {
+			if err != nil {
+				return tool.CallResult{
+					CallID:  fc.ID,
+					Name:    fc.Name,
+					Result:  map[string]any{"error": err.Error()},
+					Error:   err.Error(),
+					Actions: compactEventActions(actions),
+				}
+			}
+			return tool.CallResult{CallID: fc.ID, Name: fc.Name, Result: result, Actions: compactEventActions(actions)}
+		}
+	}
 
 	for _, cb := range f.BeforeToolCallbacks {
 		if cb == nil {
@@ -295,25 +401,28 @@ func (f *Flow) executeToolCall(ctx context.InvocationContext, fc *event.Function
 		if result != nil || err != nil {
 			if err != nil {
 				return tool.CallResult{
-					CallID: fc.ID,
-					Name:   fc.Name,
-					Result: map[string]any{"error": err.Error()},
-					Error:  err.Error(),
+					CallID:  fc.ID,
+					Name:    fc.Name,
+					Result:  map[string]any{"error": err.Error()},
+					Error:   err.Error(),
+					Actions: compactEventActions(actions),
 				}
 			}
-			return tool.CallResult{CallID: fc.ID, Name: fc.Name, Result: result}
+			return tool.CallResult{CallID: fc.ID, Name: fc.Name, Result: result, Actions: compactEventActions(actions)}
 		}
 	}
 
 	t := f.lookupTool(fc.Name)
 	if t == nil {
 		errMsg := fmt.Sprintf("tool %q not found", fc.Name)
-		return tool.CallResult{
-			CallID: fc.ID,
-			Name:   fc.Name,
-			Result: map[string]any{"error": errMsg},
-			Error:  errMsg,
+		cr := tool.CallResult{
+			CallID:  fc.ID,
+			Name:    fc.Name,
+			Result:  map[string]any{"error": errMsg},
+			Error:   errMsg,
+			Actions: compactEventActions(actions),
 		}
+		return f.applyAfterToolPluginAndCallbacks(ctx, tctx, fc, args, cr)
 	}
 
 	var cr tool.CallResult
@@ -325,20 +434,88 @@ func (f *Flow) executeToolCall(ctx context.InvocationContext, fc *event.Function
 	default:
 		errMsg := fmt.Sprintf("tool %q is not executable", fc.Name)
 		cr = tool.CallResult{
-			CallID: fc.ID,
-			Name:   fc.Name,
-			Result: map[string]any{"error": errMsg},
-			Error:  errMsg,
+			CallID:  fc.ID,
+			Name:    fc.Name,
+			Result:  map[string]any{"error": errMsg},
+			Error:   errMsg,
+			Actions: compactEventActions(actions),
+		}
+	}
+
+	cr.Actions = compactEventActions(actions)
+	return f.applyAfterToolPluginAndCallbacks(ctx, tctx, fc, args, cr)
+}
+
+func (f *Flow) applyAfterToolPluginAndCallbacks(ctx context.InvocationContext, tctx callbackctx.ToolContext, fc *event.FunctionCall, args map[string]any, cr tool.CallResult) tool.CallResult {
+	var runErr error
+	if cr.Error != "" {
+		runErr = fmt.Errorf("%s", cr.Error)
+	}
+
+	if runErr != nil && f.PluginManager != nil {
+		recoveryResult, recoveryErr := f.PluginManager.RunOnToolErrorCallback(tctx, fc.Name, args, runErr)
+		if recoveryResult != nil || recoveryErr != nil {
+			if recoveryErr != nil {
+				cr.Error = recoveryErr.Error()
+				if recoveryResult != nil {
+					recoveryResult["error"] = recoveryErr.Error()
+					cr.Result = recoveryResult
+				} else {
+					cr.Result = map[string]any{"error": recoveryErr.Error()}
+				}
+			} else {
+				cr.Result = recoveryResult
+				cr.Error = ""
+				runErr = nil
+			}
+		}
+	}
+
+	if f.PluginManager != nil {
+		overrideResult, overrideErr := f.PluginManager.RunAfterToolCallback(tctx, fc.Name, args, cr.Result, runErr)
+		if overrideResult != nil || overrideErr != nil {
+			if overrideErr != nil {
+				cr.Error = overrideErr.Error()
+				if overrideResult != nil {
+					overrideResult["error"] = overrideErr.Error()
+					cr.Result = overrideResult
+				} else {
+					cr.Result = map[string]any{"error": overrideErr.Error()}
+				}
+			} else {
+				cr.Result = overrideResult
+				cr.Error = ""
+			}
+			cr.Actions = compactEventActions(tctx.Actions())
+			return cr
+		}
+	}
+
+	for _, cb := range f.AfterToolCallbacksCtx {
+		if cb == nil {
+			continue
+		}
+		overrideResult, overrideErr := cb(tctx, fc.Name, args, cr.Result, runErr)
+		if overrideResult != nil || overrideErr != nil {
+			if overrideErr != nil {
+				cr.Error = overrideErr.Error()
+				if overrideResult != nil {
+					overrideResult["error"] = overrideErr.Error()
+					cr.Result = overrideResult
+				} else {
+					cr.Result = map[string]any{"error": overrideErr.Error()}
+				}
+			} else {
+				cr.Result = overrideResult
+				cr.Error = ""
+			}
+			break
 		}
 	}
 
 	for _, cb := range f.AfterToolCallbacks {
 		if cb == nil {
 			continue
-		}
-		var runErr error
-		if cr.Error != "" {
-			runErr = fmt.Errorf("%s", cr.Error)
 		}
 		overrideResult, overrideErr := cb(ctx, fc.Name, args, cr.Result, runErr)
 		if overrideResult != nil || overrideErr != nil {
@@ -358,6 +535,7 @@ func (f *Flow) executeToolCall(ctx context.InvocationContext, fc *event.Function
 		}
 	}
 
+	cr.Actions = compactEventActions(tctx.Actions())
 	return cr
 }
 
@@ -403,11 +581,71 @@ func mergeResultsToEvent(ctx context.InvocationContext, step int, results []tool
 	if stateDelta != nil {
 		ev.Actions.StateDelta = stateDelta
 	}
+	for _, r := range results {
+		ev.Actions = mergeEventActions(ev.Actions, r.Actions)
+	}
 	if len(errParts) > 0 {
 		ev.ErrorMessage = strings.Join(errParts, "; ")
 	}
 
 	return ev
+}
+
+func mergeEventActions(dst, src event.EventActions) event.EventActions {
+	if len(src.StateDelta) > 0 {
+		if dst.StateDelta == nil {
+			dst.StateDelta = make(map[string]any, len(src.StateDelta))
+		}
+		for k, v := range src.StateDelta {
+			dst.StateDelta[k] = v
+		}
+	}
+	if len(src.ArtifactDelta) > 0 {
+		if dst.ArtifactDelta == nil {
+			dst.ArtifactDelta = make(map[string]int64, len(src.ArtifactDelta))
+		}
+		for k, v := range src.ArtifactDelta {
+			dst.ArtifactDelta[k] = v
+		}
+	}
+	if src.TransferToAgent != "" {
+		dst.TransferToAgent = src.TransferToAgent
+	}
+	if src.EndInvocation {
+		dst.EndInvocation = true
+	}
+	if src.Escalate {
+		dst.Escalate = true
+	}
+	if src.SkipSummarization {
+		dst.SkipSummarization = true
+	}
+	if len(src.RequestedToolConfirmations) > 0 {
+		if dst.RequestedToolConfirmations == nil {
+			dst.RequestedToolConfirmations = make(map[string]event.ToolConfirmation, len(src.RequestedToolConfirmations))
+		}
+		for k, v := range src.RequestedToolConfirmations {
+			dst.RequestedToolConfirmations[k] = v
+		}
+	}
+	return compactEventActions(&dst)
+}
+
+func compactEventActions(actions *event.EventActions) event.EventActions {
+	if actions == nil {
+		return event.EventActions{}
+	}
+	compact := *actions
+	if len(compact.StateDelta) == 0 {
+		compact.StateDelta = nil
+	}
+	if len(compact.ArtifactDelta) == 0 {
+		compact.ArtifactDelta = nil
+	}
+	if len(compact.RequestedToolConfirmations) == 0 {
+		compact.RequestedToolConfirmations = nil
+	}
+	return compact
 }
 
 func (f *Flow) injectToolDeclarations(req *model.LLMRequest) {

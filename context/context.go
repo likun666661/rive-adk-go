@@ -17,9 +17,28 @@ import (
 
 	"github.com/likun666661/rive-adk-go/agent"
 	"github.com/likun666661/rive-adk-go/artifact"
+	"github.com/likun666661/rive-adk-go/callbackctx"
 	"github.com/likun666661/rive-adk-go/memory"
 	"github.com/likun666661/rive-adk-go/session"
 )
+
+// ReadonlyContext exposes readonly identity, session, user, app, and branch
+// information to callbacks. It is a minimal read-only surface designed to
+// prevent callbacks from calling EndInvocation() or accessing RunConfig().
+//
+// The canonical definition lives in callbackctx.ReadonlyContext.
+type ReadonlyContext = callbackctx.ReadonlyContext
+
+// CallbackContext is the unified callback context providing readonly information
+// plus write-through state and artifact/memory service access.
+//
+// The canonical definition lives in callbackctx.CallbackContext.
+type CallbackContext = callbackctx.CallbackContext
+
+// ToolContext extends CallbackContext with tool-specific metadata.
+//
+// The canonical definition lives in callbackctx.ToolContext.
+type ToolContext = callbackctx.ToolContext
 
 // InvocationContext is the central context passed through agent execution.
 // It wraps a standard Go context and provides access to runtime resources.
@@ -31,6 +50,12 @@ type InvocationContext interface {
 	InvocationID() string
 	Branch() string
 	UserContent() string
+
+	AgentName() string
+	UserID() string
+	AppName() string
+	SessionID() string
+	ReadonlyState() session.ReadonlyState
 
 	MemoryService() memory.Service
 	ArtifactService() artifact.Service
@@ -84,12 +109,20 @@ type invocationContext struct {
 }
 
 func (c *invocationContext) Agent() agent.Agent              { return c.ag }
+func (c *invocationContext) AgentName() string               { return c.ag.Name() }
 func (c *invocationContext) Session() session.Session          { return c.session }
+func (c *invocationContext) UserID() string                    { return c.session.UserID() }
+func (c *invocationContext) AppName() string                   { return c.session.AppName() }
+func (c *invocationContext) SessionID() string                 { return c.session.ID() }
 func (c *invocationContext) MemoryService() memory.Service     { return c.memoryService }
 func (c *invocationContext) ArtifactService() artifact.Service { return c.artifactService }
 func (c *invocationContext) InvocationID() string              { return c.invocationID }
 func (c *invocationContext) Branch() string                    { return c.branch }
 func (c *invocationContext) UserContent() string               { return c.userContent }
+
+func (c *invocationContext) ReadonlyState() session.ReadonlyState {
+	return session.NewReadonlyState(c.session.State())
+}
 
 func (c *invocationContext) EndInvocation() {
 	c.mu.Lock()
