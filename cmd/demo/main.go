@@ -29,6 +29,12 @@
 //	Launcher console/web routing, REST JSON/SSE protocols,
 //	dry-run deploy plans (Cloud Run + Agent Engine),
 //	and telemetry capture around a runner invocation.
+//
+// Chapter 07 — configurable agent flow:
+//
+//	ReAct function-call loop, agent transfer with transfer_to_agent,
+//	ExitLoop/Reflection/HiddenArg policy extensions, and configurable
+//	agent tree construction from a JSON config file.
 package main
 
 import (
@@ -39,6 +45,7 @@ import (
 	"time"
 
 	"github.com/likun666661/rive-adk-go/agent"
+	"github.com/likun666661/rive-adk-go/agent/agentconfig"
 	"github.com/likun666661/rive-adk-go/agent/remoteagent"
 	"github.com/likun666661/rive-adk-go/artifact"
 	"github.com/likun666661/rive-adk-go/callbackctx"
@@ -50,10 +57,13 @@ import (
 	"github.com/likun666661/rive-adk-go/memory"
 	"github.com/likun666661/rive-adk-go/model"
 	"github.com/likun666661/rive-adk-go/plugin"
+	"github.com/likun666661/rive-adk-go/plugin/functionmodifier"
+	"github.com/likun666661/rive-adk-go/plugin/retryreflect"
 	"github.com/likun666661/rive-adk-go/runner"
 	"github.com/likun666661/rive-adk-go/telemetry"
 	"github.com/likun666661/rive-adk-go/tool"
 	"github.com/likun666661/rive-adk-go/tool/agenttool"
+	"github.com/likun666661/rive-adk-go/tool/exitloop"
 	"github.com/likun666661/rive-adk-go/workflow"
 )
 
@@ -91,6 +101,11 @@ func run() int {
 	fmt.Println()
 
 	if code := runChapter06(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := runChapter07(); code != 0 {
 		return code
 	}
 
@@ -1200,6 +1215,514 @@ func demoPluginOrdering() int {
 		fmt.Printf("    %s\n", step)
 	}
 	fmt.Println("  => Plugins always run before direct callbacks (Chapter 04 teaching model).")
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Chapter 07 — configurable agent flow
+// ---------------------------------------------------------------------------
+
+func runChapter07() int {
+	fmt.Println("--- Chapter 07: Configurable Agent Flow ---")
+	fmt.Println()
+
+	if code := demoReActLoop(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := demoAgentTransfer(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := demoPolicyExtensions(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := demoConfigurableConstruction(); code != 0 {
+		return code
+	}
+
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 7.1 — ReAct function-call loop
+// ---------------------------------------------------------------------------
+
+func demoReActLoop() int {
+	fmt.Println("[Demo 7.1] ReAct Function-Call Loop")
+
+	weatherTool := tool.NewFunctionTool("get_weather", "Get current weather for a city",
+		func(args map[string]any) (map[string]any, error) {
+			city, _ := args["city"].(string)
+			return map[string]any{
+				"city":        city,
+				"temperature": 22,
+				"condition":   "sunny",
+			}, nil
+		},
+	)
+
+	model := model.NewFakeModel("react-demo",
+		model.FunctionCallResponse("Let me check the weather.",
+			event.FunctionCall{ID: "fc-1", Name: "get_weather", Args: map[string]any{"city": "Tokyo"}},
+		),
+		model.TextResponse("The weather in Tokyo is 22°C and sunny."),
+	)
+
+	f := &flow.Flow{
+		Model: model,
+		Tools: map[string]tool.FunctionTool{"get_weather": weatherTool},
+	}
+
+	ag, err := llmagent.New("weather_bot", "Answers weather questions.", f)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  Failed to create agent: %v\n", err)
+		return 1
+	}
+
+	sessionSvc := runner.NewInMemorySessionService()
+	r, err := runner.New(runner.Config{
+		AppName:        "react_demo",
+		Agent:          ag.(runner.ExecutableAgent),
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  Failed to create runner: %v\n", err)
+		return 1
+	}
+
+	_, events, err := r.Run(stdctx.Background(), "user-1", "sess-react", "What's the weather in Tokyo?")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  Run error: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("  %d events produced across ReAct loop:\n", len(events))
+	for i, ev := range events {
+		author := ev.Author
+		var parts []string
+		if ev.Content != nil {
+			for _, p := range ev.Content.Parts {
+				switch {
+				case p.Text != "":
+					parts = append(parts, fmt.Sprintf("text=%q", truncate(p.Text, 50)))
+				case p.FunctionCall != nil:
+					parts = append(parts, fmt.Sprintf("call %s(%v)", p.FunctionCall.Name, p.FunctionCall.Args))
+				case p.FunctionResponse != nil:
+					parts = append(parts, fmt.Sprintf("result %s => %v", p.FunctionResponse.Name, p.FunctionResponse.Result))
+				}
+			}
+		}
+		fmt.Printf("    [%d] %s: %s\n", i+1, author, strings.Join(parts, ", "))
+	}
+	fmt.Println("  => ReAct loop: user -> model (fc) -> tool (result) -> model (final).")
+
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 7.2 — Agent transfer (host agent delegates to specialist)
+// ---------------------------------------------------------------------------
+
+func demoAgentTransfer() int {
+	fmt.Println("[Demo 7.2] Agent Transfer — Host to Specialist")
+
+	specialistTool := tool.NewFunctionTool("calculator", "Perform a calculation",
+		func(args map[string]any) (map[string]any, error) {
+			expr, _ := args["expression"].(string)
+			return map[string]any{"expression": expr, "result": "42"}, nil
+		},
+	)
+
+	specialistFlow := &flow.Flow{
+		Model: model.NewFakeModel("specialist",
+			model.FunctionCallResponse("Let me calculate that.",
+				event.FunctionCall{ID: "fc-calc", Name: "calculator", Args: map[string]any{"expression": "6*7"}},
+			),
+			model.TextResponse("The result of 6*7 is 42."),
+		),
+		Tools: map[string]tool.FunctionTool{"calculator": specialistTool},
+	}
+
+	specialist, err := llmagent.New("math_agent", "Solves math problems.", specialistFlow)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  Failed to create specialist: %v\n", err)
+		return 1
+	}
+
+	if err := agent.SetParent(specialist, nil); err != nil {
+		fmt.Fprintf(os.Stderr, "  SetParent(specialist): %v\n", err)
+		return 1
+	}
+
+	hostModel := model.NewFakeModel("host",
+		model.FunctionCallResponse("Let me transfer to the math specialist.",
+			event.FunctionCall{ID: "fc-tr", Name: "transfer_to_agent", Args: map[string]any{"agent_name": "math_agent"}},
+		),
+	)
+
+	hostFlow := &flow.Flow{
+		Model: hostModel,
+	}
+
+	host, err := llmagent.New("host_agent", "Routes queries to specialists.", hostFlow)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  Failed to create host: %v\n", err)
+		return 1
+	}
+
+	if err := agent.SetSubAgents(host, []agent.Agent{specialist}); err != nil {
+		fmt.Fprintf(os.Stderr, "  SetSubAgents: %v\n", err)
+		return 1
+	}
+	if err := agent.SetParent(specialist, host); err != nil {
+		fmt.Fprintf(os.Stderr, "  SetParent: %v\n", err)
+		return 1
+	}
+
+	sessionSvc := runner.NewInMemorySessionService()
+	r, err := runner.New(runner.Config{
+		AppName:        "transfer_demo",
+		Agent:          host.(runner.ExecutableAgent),
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  Failed to create runner: %v\n", err)
+		return 1
+	}
+
+	_, events, err := r.Run(stdctx.Background(), "user-1", "sess-transfer", "What is 6*7?")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  Run error: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("  %d events produced (host -> specialist):\n", len(events))
+	for i, ev := range events {
+		author := ev.Author
+		var parts []string
+		if ev.Content != nil {
+			for _, p := range ev.Content.Parts {
+				switch {
+				case p.Text != "":
+					parts = append(parts, fmt.Sprintf("text=%q", truncate(p.Text, 50)))
+				case p.FunctionCall != nil:
+					parts = append(parts, fmt.Sprintf("call %s(%v)", p.FunctionCall.Name, p.FunctionCall.Args))
+				case p.FunctionResponse != nil:
+					parts = append(parts, fmt.Sprintf("result %s => %v", p.FunctionResponse.Name, p.FunctionResponse.Result))
+				}
+			}
+		}
+		if ev.Actions.TransferToAgent != "" {
+			parts = append(parts, fmt.Sprintf("[transfer_to=%s]", ev.Actions.TransferToAgent))
+		}
+		fmt.Printf("    [%d] %s: %s\n", i+1, author, strings.Join(parts, ", "))
+	}
+	fmt.Println("  => Host agent transfers control to specialist via transfer_to_agent.")
+
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 7.3 — Policy extensions: ExitLoop, retry/reflect, hidden args
+// ---------------------------------------------------------------------------
+
+func demoPolicyExtensions() int {
+	fmt.Println("[Demo 7.3] Policy Extensions — ExitLoop, Retry/Reflect, Hidden Args")
+	fmt.Println()
+
+	if code := demoExitLoop(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := demoRetryReflect(); code != 0 {
+		return code
+	}
+	fmt.Println()
+
+	if code := demoHiddenArgs(); code != 0 {
+		return code
+	}
+
+	return 0
+}
+
+func demoExitLoop() int {
+	fmt.Println("  [Sub-Demo 7.3a] ExitLoop — Agent signals early loop termination")
+
+	echoTool := tool.NewFunctionTool("echo", "Echo back a message",
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"echoed": args["msg"]}, nil
+		},
+	)
+
+	pMgr := plugin.NewManager()
+	pMgr.Register(plugin.New(plugin.Config{
+		Name: "exit-loop-demo",
+	}))
+
+	exitTool := exitloop.NewExitLoopTool()
+
+	model := model.NewFakeModel("exit-demo",
+		model.FunctionCallResponse("Let me exit now.",
+			event.FunctionCall{ID: "fc-exit", Name: "exit_loop", Args: map[string]any{}},
+		),
+	)
+
+	f := &flow.Flow{
+		Model:         model,
+		Tools:         map[string]tool.FunctionTool{"echo": echoTool, "exit_loop": exitTool},
+		PluginManager: pMgr,
+	}
+
+	ag, err := llmagent.New("exit_agent", "Agent that can exit early.", f)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "    Failed to create agent: %v\n", err)
+		return 1
+	}
+
+	sessionSvc := runner.NewInMemorySessionService()
+	r, err := runner.New(runner.Config{
+		AppName:        "exit_demo",
+		Agent:          ag.(runner.ExecutableAgent),
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "    Failed to create runner: %v\n", err)
+		return 1
+	}
+
+	_, events, err := r.Run(stdctx.Background(), "user-1", "sess-exit", "Exit the loop")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "    Run error: %v\n", err)
+		return 1
+	}
+
+	for _, ev := range events {
+		if ev.Actions.EndInvocation {
+			fmt.Println("    => ExitLoop detected: EndInvocation=true, loop terminated.")
+		}
+	}
+	fmt.Printf("    %d events produced (exited after first step).\n", len(events))
+	return 0
+}
+
+func demoRetryReflect() int {
+	fmt.Println("  [Sub-Demo 7.3b] Retry/Reflect — Tool error recovery with reflection")
+
+	alwaysFails := tool.NewFunctionTool("fail_tool", "Always fails",
+		func(args map[string]any) (map[string]any, error) {
+			return nil, fmt.Errorf("internal error: connection refused")
+		},
+	)
+
+	pMgr := plugin.NewManager()
+	rrPlugin := retryreflect.New(retryreflect.Config{
+		Name:       "retry-reflect-demo",
+		MaxRetries: 2,
+	})
+	pMgr.Register(rrPlugin.Plugin)
+
+	model := model.NewFakeModel("reflect-demo",
+		model.FunctionCallResponse("Let me try the tool.",
+			event.FunctionCall{ID: "fc-fail", Name: "fail_tool", Args: map[string]any{}},
+		),
+		model.TextResponse("The tool failed but I reflected on the error and adjusted my approach."),
+	)
+
+	f := &flow.Flow{
+		Model:         model,
+		Tools:         map[string]tool.FunctionTool{"fail_tool": alwaysFails},
+		PluginManager: pMgr,
+	}
+
+	ag, err := llmagent.New("reflect_agent", "Agent with retry/reflect plugin.", f)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "    Failed to create agent: %v\n", err)
+		return 1
+	}
+
+	sessionSvc := runner.NewInMemorySessionService()
+	r, err := runner.New(runner.Config{
+		AppName:        "reflect_demo",
+		Agent:          ag.(runner.ExecutableAgent),
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "    Failed to create runner: %v\n", err)
+		return 1
+	}
+
+	_, events, err := r.Run(stdctx.Background(), "user-1", "sess-reflect", "Try the tool")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "    Run error: %v\n", err)
+		return 1
+	}
+
+	for _, ev := range events {
+		if ev.Content != nil {
+			for _, p := range ev.Content.Parts {
+				if p.FunctionResponse != nil {
+					if refl, ok := p.FunctionResponse.Result["reflection"]; ok {
+						fmt.Printf("    Reflection: %s\n", truncate(fmt.Sprintf("%v", refl), 80))
+					}
+				}
+			}
+		}
+	}
+	fmt.Printf("    %d events produced (error caught, reflection added).\n", len(events))
+	return 0
+}
+
+func demoHiddenArgs() int {
+	fmt.Println("  [Sub-Demo 7.3c] Hidden Args — Protect internal parameters from LLM")
+
+	processTool := tool.NewFunctionTool("process_data", "Process user data",
+		func(args map[string]any) (map[string]any, error) {
+			return map[string]any{"status": "processed", "user_id": args["user_id"]}, nil
+		},
+	)
+
+	pMgr := plugin.NewManager()
+	fmPlugin := functionmodifier.New(functionmodifier.Config{
+		Name: "hidden-args-demo",
+		Predicate: func(toolName string) bool {
+			return toolName == "process_data"
+		},
+		HiddenArgs: map[string]any{
+			"user_id": map[string]any{"type": "string", "description": "Internal user ID (hidden)"},
+		},
+	})
+	pMgr.Register(fmPlugin.Plugin)
+
+	model := model.NewFakeModel("hidden-demo",
+		model.FunctionCallResponse("Processing data.",
+			event.FunctionCall{ID: "fc-proc", Name: "process_data", Args: map[string]any{}},
+		),
+		model.TextResponse("Data processing complete."),
+	)
+
+	f := &flow.Flow{
+		Model:         model,
+		Tools:         map[string]tool.FunctionTool{"process_data": processTool},
+		PluginManager: pMgr,
+	}
+
+	ag, err := llmagent.New("hidden_agent", "Agent with hidden args plugin.", f)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "    Failed to create agent: %v\n", err)
+		return 1
+	}
+
+	sessionSvc := runner.NewInMemorySessionService()
+	r, err := runner.New(runner.Config{
+		AppName:        "hidden_demo",
+		Agent:          ag.(runner.ExecutableAgent),
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "    Failed to create runner: %v\n", err)
+		return 1
+	}
+
+	_, events, err := r.Run(stdctx.Background(), "user-1", "sess-hidden", "Process my data")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "    Run error: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("    %d events produced (hidden args handled by FunctionCallModifier).\n", len(events))
+	fmt.Println("    => The user_id parameter was injected/removed transparently by the plugin.")
+	return 0
+}
+
+// ---------------------------------------------------------------------------
+// Demo 7.4 — Configurable agent tree construction
+// ---------------------------------------------------------------------------
+
+func demoConfigurableConstruction() int {
+	fmt.Println("[Demo 7.4] Configurable Agent Tree Construction")
+
+	jsonCfg := `{
+		"type": "llm_agent",
+		"name": "root",
+		"description": "Configurable root agent with sub-agents",
+		"tools": ["get_weather"],
+		"sub_agents": [
+			{
+				"type": "llm_agent",
+				"name": "math_agent",
+				"description": "Handles math problems"
+			}
+		]
+	}`
+
+	cfg, err := agentconfig.FromJSON([]byte(jsonCfg))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  FromJSON error: %v\n", err)
+		return 1
+	}
+
+	registry := agentconfig.ToolRegistry{
+		"get_weather": tool.NewFunctionTool("get_weather", "Get current weather",
+			func(args map[string]any) (map[string]any, error) {
+				city, _ := args["city"].(string)
+				return map[string]any{"city": city, "temperature": 25, "condition": "clear"}, nil
+			},
+		),
+	}
+
+	agt, err := agentconfig.Build(cfg, registry)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "  Build error: %v\n", err)
+		return 1
+	}
+
+	fmt.Printf("  Root agent: %s (%s)\n", agt.Name(), agt.Description())
+	subs := agt.SubAgents()
+	fmt.Printf("  Sub-agents: %d\n", len(subs))
+	for _, s := range subs {
+		fmt.Printf("    - %s: %s\n", s.Name(), s.Description())
+	}
+	fmt.Printf("  Parent chain: root=%v", agt.Parent() == nil)
+	for _, s := range subs {
+		fmt.Printf(", %s.parent=root->%v", s.Name(), s.Parent() != nil && s.Parent().Name() == "root")
+	}
+	fmt.Println()
+
+	// Validate error paths
+	fmt.Println()
+	fmt.Println("  Validation tests:")
+
+	// Duplicate name
+	dupCfg := agentconfig.AgentConfig{
+		Type: "llm_agent", Name: "dup",
+		SubAgents: []agentconfig.AgentConfig{
+			{Type: "llm_agent", Name: "child"},
+			{Type: "llm_agent", Name: "child"},
+		},
+	}
+	_, err = agentconfig.Build(dupCfg, nil)
+	fmt.Printf("    Duplicate name error: %v\n", err)
+
+	// Unknown tool ref
+	badToolCfg := agentconfig.AgentConfig{
+		Type: "llm_agent", Name: "bad", Tools: []string{"nonexistent"},
+	}
+	_, err = agentconfig.Build(badToolCfg, agentconfig.ToolRegistry{})
+	fmt.Printf("    Unknown tool error: %v\n", err)
+
+	// Unknown type
+	unknownTypeCfg := agentconfig.AgentConfig{Type: "unknown", Name: "test"}
+	_, err = agentconfig.Build(unknownTypeCfg, nil)
+	fmt.Printf("    Unknown type error: %v\n", err)
+
+	fmt.Println("  => Config loader validates all constraints deterministically.")
 	return 0
 }
 

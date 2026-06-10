@@ -83,6 +83,18 @@ type RemoteAgent struct {
 
 func (a *RemoteAgent) Name() string        { return a.name }
 func (a *RemoteAgent) Description() string { return a.description }
+func (a *RemoteAgent) Parent() agent.Agent { return nil }
+func (a *RemoteAgent) DisallowTransferToParent() bool { return false }
+func (a *RemoteAgent) DisallowTransferToPeers() bool  { return false }
+
+func (a *RemoteAgent) SubAgents() []agent.Agent { return nil }
+
+func (a *RemoteAgent) FindAgent(name string) agent.Agent {
+	if a.name == name {
+		return a
+	}
+	return nil
+}
 
 // Execute sends a request to the remote agent and collects the response
 // events. It implements the full lifecycle:

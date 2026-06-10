@@ -4,20 +4,29 @@
 //
 //	Runner.Run:
 //	  1. Get or create session
-//	  2. Create user event and append to session
-//	  3. Create InvocationContext
-//	  4. Execute agent
-//	  5. Persist non-partial events to session
-//	  6. Yield all events to caller
+//	  2. Find the active agent from session history (or fall back to root)
+//	  3. Create user event and append to session
+//	  4. Create InvocationContext
+//	  5. Execute agent
+//	  6. Persist non-partial events to session
+//	  7. Yield all events to caller
 //
 // The Runner is the entry point for user interactions. It manages
 // session lifecycle and ensures events are properly persisted.
+//
+// Agent tree routing:
+//
+// After a TransferToAgent action, subsequent user messages in the same
+// session are routed to the active agent implied by session history.
+// The runner scans events backwards, skipping user-author events, and
+// finds the first agent whose full ancestor chain allows transfer.
 package runner
 
 import (
 	stdctx "context"
 	stderrors "errors"
 	"fmt"
+	"log"
 
 	"github.com/likun666661/rive-adk-go/agent"
 	"github.com/likun666661/rive-adk-go/artifact"
@@ -106,11 +115,12 @@ func New(cfg Config) (*Runner, error) {
 //
 // Flow:
 //  1. Get or create the session
-//  2. Create a user event and append it to the session
-//  3. Build an InvocationContext
-//  4. Execute the agent (agent.Execute → Run → Flow.Run → ...)
-//  5. Persist non-partial events to the session
-//  6. Return the session and all events
+//  2. Find the active agent from session history
+//  3. Create a user event and append it to the session
+//  4. Build an InvocationContext
+//  5. Execute the active agent (agent.Execute → Run → Flow.Run → ...)
+//  6. Persist non-partial events to the session
+//  7. Return the session and all events
 func (r *Runner) Run(ctx stdctx.Context, userID, sessionID, message string) (session.Session, []*event.Event, error) {
 	sess, err := r.sessionService.Get(ctx, r.appName, userID, sessionID)
 	if err != nil {
@@ -140,18 +150,26 @@ func (r *Runner) Run(ctx stdctx.Context, userID, sessionID, message string) (ses
 		return nil, nil, fmt.Errorf("runner: failed to append user event: %w", err)
 	}
 
+	agentToRun := r.findAgentToRun(sess)
+	ea, ok := agentToRun.(ExecutableAgent)
+	if !ok {
+		agentToRun = r.agent
+		ea = r.agent
+	}
+
 	ic := invctx.NewInvocationContext(invctx.Params{
 		Ctx:          ctx,
-		Agent:        r.agent,
+		Agent:        agentToRun,
+		RootAgent:    r.agent,
 		Session:      sess,
 		Memory:       r.memoryService,
 		Artifact:     r.artifactService,
 		InvocationID: invocationID,
-		Branch:       r.agent.Name(),
+		Branch:       agentToRun.Name(),
 		UserContent:  message,
 	})
 
-	sessEvents, err := r.agent.Execute(ic)
+	sessEvents, err := ea.Execute(ic)
 	if err != nil {
 		return sess, sessEvents, fmt.Errorf("runner: agent execution error: %w", err)
 	}
@@ -166,4 +184,44 @@ func (r *Runner) Run(ctx stdctx.Context, userID, sessionID, message string) (ses
 	}
 
 	return sess, sessEvents, err
+}
+
+// findAgentToRun determines which agent should handle the next user message
+// by scanning session history for the last non-user event authored by a
+// transferable agent.
+func (r *Runner) findAgentToRun(sess session.Session) agent.Agent {
+	events := sess.Events()
+	for i := len(events) - 1; i >= 0; i-- {
+		ev := events[i]
+		if ev == nil {
+			continue
+		}
+		if ev.Author == "user" {
+			continue
+		}
+
+		candidate := r.agent.FindAgent(ev.Author)
+		if candidate == nil {
+			log.Printf("Event from unknown agent: %s, event id: %s", ev.Author, ev.ID)
+			continue
+		}
+
+		if r.isTransferableAcrossAgentTree(candidate) {
+			return candidate
+		}
+	}
+
+	return r.agent
+}
+
+// isTransferableAcrossAgentTree checks if the given agent and all its ancestors
+// allow transfer up the tree. An agent is transferable only if every ancestor
+// in the chain (including itself) has DisallowTransferToParent == false.
+func (r *Runner) isTransferableAcrossAgentTree(a agent.Agent) bool {
+	for cur := a; cur != nil; cur = cur.Parent() {
+		if cur.DisallowTransferToParent() {
+			return false
+		}
+	}
+	return true
 }

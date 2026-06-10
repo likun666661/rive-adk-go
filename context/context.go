@@ -46,6 +46,7 @@ type InvocationContext interface {
 	stdctx.Context
 
 	Agent() agent.Agent
+	RootAgent() agent.Agent
 	Session() session.Session
 	InvocationID() string
 	Branch() string
@@ -68,6 +69,7 @@ type InvocationContext interface {
 type Params struct {
 	Ctx          stdctx.Context
 	Agent        agent.Agent
+	RootAgent    agent.Agent
 	Session      session.Session
 	Memory       memory.Service
 	Artifact     artifact.Service
@@ -77,13 +79,19 @@ type Params struct {
 }
 
 // NewInvocationContext creates a new invocation context from parameters.
+// If RootAgent is nil, Agent is used as the root agent.
 func NewInvocationContext(p Params) InvocationContext {
 	if p.Ctx == nil {
 		p.Ctx = stdctx.Background()
 	}
+	rootAgent := p.RootAgent
+	if rootAgent == nil {
+		rootAgent = p.Agent
+	}
 	return &invocationContext{
 		Context:         p.Ctx,
 		ag:              p.Agent,
+		rootAgent:       rootAgent,
 		session:         p.Session,
 		memoryService:   p.Memory,
 		artifactService: p.Artifact,
@@ -97,6 +105,7 @@ type invocationContext struct {
 	stdctx.Context
 
 	ag              agent.Agent
+	rootAgent       agent.Agent
 	session         session.Session
 	memoryService   memory.Service
 	artifactService artifact.Service
@@ -109,6 +118,7 @@ type invocationContext struct {
 }
 
 func (c *invocationContext) Agent() agent.Agent              { return c.ag }
+func (c *invocationContext) RootAgent() agent.Agent            { return c.rootAgent }
 func (c *invocationContext) AgentName() string               { return c.ag.Name() }
 func (c *invocationContext) Session() session.Session          { return c.session }
 func (c *invocationContext) UserID() string                    { return c.session.UserID() }

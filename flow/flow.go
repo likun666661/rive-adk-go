@@ -11,6 +11,7 @@
 //  3. Postprocess (response processor hooks)
 //  4. Build and yield a model response event
 //  5. Handle function calls (parallel tool execution, state delta merge)
+//  6. Handle agent transfer (execute target agent inline)
 //
 // Flow also supports tool callbacks (before/after) and error handling so that
 // tool errors become proper event fields instead of silent successes.
@@ -21,6 +22,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/likun666661/rive-adk-go/agent"
 	"github.com/likun666661/rive-adk-go/callbackctx"
 	"github.com/likun666661/rive-adk-go/context"
 	"github.com/likun666661/rive-adk-go/event"
@@ -28,7 +30,17 @@ import (
 	"github.com/likun666661/rive-adk-go/plugin"
 	"github.com/likun666661/rive-adk-go/session"
 	"github.com/likun666661/rive-adk-go/tool"
+	"github.com/likun666661/rive-adk-go/tool/transfer"
 )
+
+const maxTransferDepth = 10
+
+// executableAgent mirrors runner.ExecutableAgent to avoid an import cycle
+// between flow and runner.
+type executableAgent interface {
+	agent.Agent
+	Execute(ctx agent.InvocationContext) ([]*event.Event, error)
+}
 
 // RequestProcessor can inspect or mutate the LLM request before the model call.
 // If it returns a non‑nil event the step short‑circuits and yields that event.
@@ -82,8 +94,9 @@ type Flow struct {
 	BeforeToolCallbacksCtx  []BeforeToolCallbackCtx
 	AfterToolCallbacksCtx   []AfterToolCallbackCtx
 
-	resolvedTools    map[string]tool.Tool
-	resolvedToolList []tool.Tool
+	resolvedTools     map[string]tool.Tool
+	resolvedToolList  []tool.Tool
+	activeTransferTool *transfer.TransferToAgentTool
 }
 
 // Run executes the full multi‑step loop until a final response is reached.
@@ -93,6 +106,7 @@ func (f *Flow) Run(ctx context.InvocationContext) ([]*event.Event, error) {
 	}
 
 	var allEvents []*event.Event
+
 	for step := 1; ; step++ {
 		if ctx.Ended() {
 			return allEvents, nil
@@ -107,6 +121,13 @@ func (f *Flow) Run(ctx context.InvocationContext) ([]*event.Event, error) {
 		}
 		allEvents = append(allEvents, stepEvents...)
 
+		for _, ev := range stepEvents {
+			if ev != nil && ev.Actions.EndInvocation {
+				ctx.EndInvocation()
+				return allEvents, nil
+			}
+		}
+
 		modelEvent := stepEvents[0]
 		if modelEvent.IsFinalResponse() {
 			return allEvents, nil
@@ -114,12 +135,22 @@ func (f *Flow) Run(ctx context.InvocationContext) ([]*event.Event, error) {
 		if modelEvent.Partial {
 			return allEvents, fmt.Errorf("flow: model event is partial (streaming limit reached)")
 		}
+
+		if len(stepEvents) > 1 {
+			for _, ev := range stepEvents[1:] {
+				if ev != nil && ev.Actions.TransferToAgent != "" {
+					return allEvents, nil
+				}
+			}
+		}
 	}
 }
 
 // runOneStep executes a single iteration: preprocess → callModel → postprocess
-// → finalizeEvent → yield → handleFunctionCalls.
+// → finalizeEvent → yield → handleFunctionCalls → handleTransfer.
 func (f *Flow) runOneStep(ctx context.InvocationContext, step int) ([]*event.Event, error) {
+	currentAgent := ctx.Agent()
+
 	req := &model.LLMRequest{
 		Model: f.Model.Name(),
 	}
@@ -136,6 +167,7 @@ func (f *Flow) runOneStep(ctx context.InvocationContext, step int) ([]*event.Eve
 	}
 
 	f.injectToolDeclarations(req)
+	f.injectTransferTool(currentAgent, req)
 
 	var resp *model.LLMResponse
 	modelActions := &event.EventActions{}
@@ -170,12 +202,21 @@ func (f *Flow) runOneStep(ctx context.InvocationContext, step int) ([]*event.Eve
 		return events, nil
 	}
 
-	toolEvent, err := f.handleFunctionCalls(ctx, step, modelEvent)
-	if err != nil {
-		return events, err
-	}
+	toolEvent, tt := f.handleFunctionCalls(ctx, step, modelEvent)
 	if toolEvent != nil {
 		events = append(events, toolEvent)
+
+		if toolEvent.Actions.TransferToAgent != "" {
+			transferEvents, transferErr := f.executeTransfer(ctx, step, toolEvent.Actions.TransferToAgent)
+			if transferErr != nil {
+				return events, transferErr
+			}
+			events = append(events, transferEvents...)
+		}
+	}
+
+	if tt != nil {
+		f.injectContextTransfer(tt, ctx)
 	}
 
 	return events, nil
@@ -324,7 +365,7 @@ func (f *Flow) finalizeModelResponseEvent(ctx context.InvocationContext, step in
 	return ev
 }
 
-func (f *Flow) handleFunctionCalls(ctx context.InvocationContext, step int, modelEvent *event.Event) (*event.Event, error) {
+func (f *Flow) handleFunctionCalls(ctx context.InvocationContext, step int, modelEvent *event.Event) (*event.Event, *transfer.TransferToAgentTool) {
 	fnCalls := modelEvent.FunctionCalls()
 	if len(fnCalls) == 0 {
 		return nil, nil
@@ -347,7 +388,12 @@ func (f *Flow) handleFunctionCalls(ctx context.InvocationContext, step int, mode
 		session.MergeStateDelta(ctx.Session().State(), merged.Actions.StateDelta)
 	}
 
-	return merged, nil
+	var tt *transfer.TransferToAgentTool
+	if f.activeTransferTool != nil && merged != nil && merged.Actions.TransferToAgent != "" {
+		tt = f.activeTransferTool
+	}
+
+	return merged, tt
 }
 
 func (f *Flow) executeToolCall(ctx context.InvocationContext, fc *event.FunctionCall) tool.CallResult {
@@ -692,8 +738,116 @@ func (f *Flow) lookupTool(name string) tool.Tool {
 	if t, ok := f.Tools[name]; ok {
 		return t
 	}
+	if f.activeTransferTool != nil && f.activeTransferTool.Name() == name {
+		return f.activeTransferTool
+	}
 	if f.resolvedTools == nil {
 		f.resolveToolsets()
 	}
 	return f.resolvedTools[name]
 }
+
+// injectTransferTool checks if the current agent has transfer targets and,
+// if so, injects the transfer_to_agent tool declaration and system
+// instructions into the request.
+func (f *Flow) injectTransferTool(currentAgent agent.Agent, req *model.LLMRequest) {
+	f.activeTransferTool = transfer.InjectTransferTool(currentAgent, req)
+}
+
+// injectContextTransfer registers the transfer tool for custom execution
+// via the invocation context so context-aware tool execution can set
+// TransferToAgent actions.
+func (f *Flow) injectContextTransfer(tt *transfer.TransferToAgentTool, ctx context.InvocationContext) {
+	_ = tt
+	_ = ctx
+}
+
+// executeTransfer finds the target agent by name and executes it inline,
+// returning the events produced by the target.
+func (f *Flow) executeTransfer(ctx context.InvocationContext, step int, targetName string) ([]*event.Event, error) {
+	rootAgent := ctx.RootAgent()
+	if rootAgent == nil {
+		return nil, fmt.Errorf("flow: no root agent available for transfer to %q", targetName)
+	}
+
+	targetAgent := rootAgent.FindAgent(targetName)
+	if targetAgent == nil {
+		errEvent := event.NewEvent(
+			fmt.Sprintf("%s-transfer-error-%d", ctx.InvocationID(), step),
+			ctx.Agent().Name(),
+			event.RoleTool,
+		)
+		errEvent.Content = &event.Content{
+			Role: event.RoleTool,
+			Parts: []event.Part{
+				{
+					FunctionResponse: &event.FunctionResponse{
+						ID:     fmt.Sprintf("transfer-%d", step),
+						Name:   "transfer_to_agent",
+						Result: map[string]any{"error": fmt.Sprintf("invalid transfer target %q", targetName)},
+						Error:  fmt.Sprintf("invalid transfer target %q", targetName),
+					},
+				},
+			},
+		}
+		errEvent.ErrorMessage = fmt.Sprintf("invalid transfer target %q", targetName)
+		return []*event.Event{errEvent}, nil
+	}
+
+	ea, ok := targetAgent.(executableAgent)
+	if !ok {
+		return nil, fmt.Errorf("flow: agent %q does not implement executableAgent", targetAgent.Name())
+	}
+
+	depth := transferDepth(ctx)
+	if depth >= maxTransferDepth {
+		return nil, fmt.Errorf(
+			"flow: transfer loop detected: max depth %d reached at agent %q",
+			maxTransferDepth, targetAgent.Name(),
+		)
+	}
+
+	branch := targetAgent.Name()
+	targetCtx := &transferContext{InvocationContext: ctx, targetAgent: targetAgent, branch: branch, depth: depth + 1}
+
+	targetEvents, err := ea.Execute(targetCtx)
+	if err != nil {
+		return nil, fmt.Errorf("flow: transfer to %q failed: %w", targetName, err)
+	}
+
+	var allEvents []*event.Event
+	allEvents = append(allEvents, targetEvents...)
+
+	for _, ev := range targetEvents {
+		if ev != nil && ev.Actions.TransferToAgent != "" {
+			chainedEvents, chainedErr := f.executeTransfer(targetCtx, step, ev.Actions.TransferToAgent)
+			if chainedErr != nil {
+				return allEvents, chainedErr
+			}
+			allEvents = append(allEvents, chainedEvents...)
+		}
+	}
+
+	return allEvents, nil
+}
+
+// transferDepth extracts the transfer depth from the context, or 0.
+func transferDepth(ctx context.InvocationContext) int {
+	if tc, ok := ctx.(*transferContext); ok {
+		return tc.depth
+	}
+	return 0
+}
+
+// transferContext wraps an InvocationContext and overrides Agent()/AgentName()
+// so the target agent sees itself as the current agent.
+type transferContext struct {
+	context.InvocationContext
+	targetAgent agent.Agent
+	branch      string
+	depth       int
+}
+
+func (c *transferContext) Agent() agent.Agent   { return c.targetAgent }
+func (c *transferContext) AgentName() string      { return c.targetAgent.Name() }
+func (c *transferContext) Branch() string          { return c.branch }

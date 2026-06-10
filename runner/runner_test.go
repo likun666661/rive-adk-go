@@ -13,6 +13,7 @@ import (
 	"github.com/likun666661/rive-adk-go/llmagent"
 	"github.com/likun666661/rive-adk-go/memory"
 	"github.com/likun666661/rive-adk-go/model"
+	"github.com/likun666661/rive-adk-go/session"
 	"github.com/likun666661/rive-adk-go/tool"
 )
 
@@ -1597,4 +1598,402 @@ func TestRunnerFullChainToolsetDeclarations(t *testing.T) {
 	if sess.EventCount() != 4 {
 		t.Fatalf("expected 4 session events, got %d", sess.EventCount())
 	}
+}
+
+// =============================================================================
+// Chapter 07 — Agent transfer routing tests
+// =============================================================================
+
+// newParentAgentWithSub creates a parent agent with a named sub-agent for
+// testing transfer routing.
+func newParentAgentWithSub(t *testing.T, sub agent.Agent) ExecutableAgent {
+	t.Helper()
+	a, err := agent.New(agent.Config{
+		Name:        "root",
+		Description: "Root agent",
+		SubAgents:   []agent.Agent{sub},
+		Run:         func(ctx agent.InvocationContext) ([]*event.Event, error) { return nil, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ea, ok := agent.Agent(a).(ExecutableAgent)
+	if !ok {
+		t.Fatal("agent does not implement ExecutableAgent")
+	}
+	return ea
+}
+
+func newSimpleSubAgent(t *testing.T, name, desc string) agent.Agent {
+	t.Helper()
+	a, err := agent.New(agent.Config{
+		Name:        name,
+		Description: desc,
+		Run:         func(ctx agent.InvocationContext) ([]*event.Event, error) { return nil, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+type nonExecutableAgent struct {
+	name   string
+	parent agent.Agent
+}
+
+func (a *nonExecutableAgent) Name() string        { return a.name }
+func (a *nonExecutableAgent) Description() string { return "non-executable test agent" }
+func (a *nonExecutableAgent) SubAgents() []agent.Agent {
+	return nil
+}
+func (a *nonExecutableAgent) FindAgent(name string) agent.Agent {
+	if a.name == name {
+		return a
+	}
+	return nil
+}
+func (a *nonExecutableAgent) Parent() agent.Agent            { return a.parent }
+func (a *nonExecutableAgent) DisallowTransferToParent() bool { return false }
+func (a *nonExecutableAgent) DisallowTransferToPeers() bool  { return false }
+
+// ---------------------------------------------------------------------------
+// Test 24: findAgentToRun returns root when no history
+// ---------------------------------------------------------------------------
+
+func TestRunnerFindAgentToRunNoHistory(t *testing.T) {
+	sub := newSimpleSubAgent(t, "math_bot", "Solves math")
+	parent := newParentAgentWithSub(t, sub)
+
+	r := &Runner{
+		appName: "testapp",
+		agent:   parent,
+	}
+
+	sess := session.NewInMemorySession("sess-empty", "testapp", "user1")
+	agentToRun := r.findAgentToRun(sess)
+	if agentToRun.Name() != "root" {
+		t.Errorf("findAgentToRun = %q, want 'root'", agentToRun.Name())
+	}
+}
+
+func TestRunnerFindAgentToRunAfterTransfer(t *testing.T) {
+	sub := newSimpleSubAgent(t, "math_bot", "Solves math")
+	parent := newParentAgentWithSub(t, sub)
+
+	r := &Runner{
+		appName: "testapp",
+		agent:   parent,
+	}
+
+	sess := session.NewInMemorySession("sess-tf", "testapp", "user1")
+	sess.AppendEvent(event.NewEvent("ev1", "user", event.RoleUser))
+	sess.AppendEvent(event.NewEvent("ev2", "math_bot", event.RoleModel))
+
+	agentToRun := r.findAgentToRun(sess)
+	if agentToRun.Name() != "math_bot" {
+		t.Errorf("findAgentToRun = %q, want 'math_bot'", agentToRun.Name())
+	}
+}
+
+func TestRunnerFindAgentToRunSkipsUser(t *testing.T) {
+	sub := newSimpleSubAgent(t, "weather_bot", "Gets weather")
+	parent := newParentAgentWithSub(t, sub)
+
+	r := &Runner{
+		appName: "testapp",
+		agent:   parent,
+	}
+
+	sess := session.NewInMemorySession("sess-skip", "testapp", "user1")
+	sess.AppendEvent(event.NewEvent("ev1", "user", event.RoleUser))
+	sess.AppendEvent(event.NewEvent("ev2", "weather_bot", event.RoleModel))
+	sess.AppendEvent(event.NewEvent("ev3", "user", event.RoleUser))
+
+	agentToRun := r.findAgentToRun(sess)
+	if agentToRun.Name() != "weather_bot" {
+		t.Errorf("findAgentToRun = %q, want 'weather_bot'", agentToRun.Name())
+	}
+}
+
+func TestRunnerFallsBackToRootContextForNonExecutableActiveAgent(t *testing.T) {
+	ghost := &nonExecutableAgent{name: "ghost_bot"}
+	root, err := agent.New(agent.Config{
+		Name:      "root",
+		SubAgents: []agent.Agent{ghost},
+		Run: func(ctx agent.InvocationContext) ([]*event.Event, error) {
+			return []*event.Event{
+				event.NewEvent("root-response", ctx.Agent().Name(), event.RoleModel),
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ghost.parent = root
+
+	rootEA, ok := agent.Agent(root).(ExecutableAgent)
+	if !ok {
+		t.Fatal("root does not implement ExecutableAgent")
+	}
+
+	sessionSvc := NewInMemorySessionService()
+	sess, err := sessionSvc.Create(stdctx.Background(), "testapp", "user1", "sess-nonexec")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sess.AppendEvent(event.NewEvent("prev", "ghost_bot", event.RoleModel)); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := New(Config{
+		AppName:        "testapp",
+		Agent:          rootEA,
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, events, err := r.Run(stdctx.Background(), "user1", sess.ID(), "hello")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(events))
+	}
+	if events[0].Author != "root" {
+		t.Errorf("event author = %q, want root", events[0].Author)
+	}
+}
+
+func TestRunnerIsTransferableAcrossAgentTree(t *testing.T) {
+	grandparent, _ := agent.New(agent.Config{
+		Name:                     "grandparent",
+		DisallowTransferToParent: true,
+		Run:                      func(ctx agent.InvocationContext) ([]*event.Event, error) { return nil, nil },
+	})
+	parent, _ := agent.New(agent.Config{
+		Name:   "parent",
+		Parent: grandparent,
+		Run:    func(ctx agent.InvocationContext) ([]*event.Event, error) { return nil, nil },
+	})
+	child, _ := agent.New(agent.Config{
+		Name:   "child",
+		Parent: parent,
+		Run:    func(ctx agent.InvocationContext) ([]*event.Event, error) { return nil, nil },
+	})
+
+	rootEA, _ := agent.Agent(grandparent).(ExecutableAgent)
+	r := &Runner{agent: rootEA}
+
+	if r.isTransferableAcrossAgentTree(child) {
+		t.Error("child should NOT be transferable (grandparent disallows)")
+	}
+	if r.isTransferableAcrossAgentTree(parent) {
+		t.Error("parent should NOT be transferable (grandparent disallows)")
+	}
+	if r.isTransferableAcrossAgentTree(grandparent) {
+		t.Error("grandparent itself should NOT be transferable (disallows)")
+	}
+}
+
+func TestRunnerIsTransferableWhenAllowed(t *testing.T) {
+	grandparent, _ := agent.New(agent.Config{
+		Name: "grandparent",
+		Run:  func(ctx agent.InvocationContext) ([]*event.Event, error) { return nil, nil },
+	})
+	parent, _ := agent.New(agent.Config{
+		Name:   "parent",
+		Parent: grandparent,
+		Run:    func(ctx agent.InvocationContext) ([]*event.Event, error) { return nil, nil },
+	})
+	child, _ := agent.New(agent.Config{
+		Name:   "child",
+		Parent: parent,
+		Run:    func(ctx agent.InvocationContext) ([]*event.Event, error) { return nil, nil },
+	})
+
+	rootEA, _ := agent.Agent(grandparent).(ExecutableAgent)
+	r := &Runner{agent: rootEA}
+
+	if !r.isTransferableAcrossAgentTree(child) {
+		t.Error("child should be transferable (no disallow in chain)")
+	}
+	if !r.isTransferableAcrossAgentTree(parent) {
+		t.Error("parent should be transferable")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 29: full end-to-end transfer: runner.Run with transfer
+// ---------------------------------------------------------------------------
+
+func TestRunnerTransferFullChain(t *testing.T) {
+	targetFlow := &flow.Flow{
+		Model: model.NewFakeModel("target-model",
+			model.TextResponse("The answer is 42."),
+		),
+	}
+	targetAgent, err := llmagent.New("math_bot", "Solves math problems", targetFlow)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parentFlow := &flow.Flow{
+		Model: model.NewFakeModel("parent-model",
+			model.FunctionCallResponse("Transferring to math.",
+				event.FunctionCall{ID: "fc1", Name: "transfer_to_agent", Args: map[string]any{"agent_name": "math_bot"}},
+			),
+		),
+	}
+
+	parentLLMAgent, err := llmagent.New("root", "Root agent", parentFlow)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rootCfg := agent.Config{
+		Name:        "root",
+		Description: "Root agent",
+		SubAgents:   []agent.Agent{targetAgent},
+		Run: func(ctx agent.InvocationContext) ([]*event.Event, error) {
+			ea, ok := parentLLMAgent.(ExecutableAgent)
+			if !ok {
+				t.Fatal("llm agent does not implement ExecutableAgent")
+			}
+			return ea.Execute(ctx)
+		},
+	}
+	root, err := agent.New(rootCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootEA, ok := agent.Agent(root).(ExecutableAgent)
+	if !ok {
+		t.Fatal("root does not implement ExecutableAgent")
+	}
+
+	sessionSvc := NewInMemorySessionService()
+	r, err := New(Config{
+		AppName:        "transfer_app",
+		Agent:          rootEA,
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sess, events, err := r.Run(stdctx.Background(), "user-1", "sess-xfer", "Solve 2+3")
+	if err != nil {
+		t.Fatalf("Run error: %v", err)
+	}
+
+	if len(events) < 3 {
+		t.Fatalf("expected at least 3 events (model fc + tool + target), got %d", len(events))
+	}
+
+	hasTransferAction := false
+	var targetEvents []*event.Event
+	for _, ev := range events {
+		if ev.Actions.TransferToAgent != "" {
+			hasTransferAction = true
+		}
+		if ev.Author == "math_bot" {
+			targetEvents = append(targetEvents, ev)
+		}
+	}
+	if !hasTransferAction {
+		t.Error("expected TransferToAgent action in events")
+	}
+	if len(targetEvents) == 0 {
+		t.Error("expected events authored by math_bot")
+	}
+
+	_ = sess
+}
+
+func TestRunnerSecondRunRoutesToActiveAgent(t *testing.T) {
+	subFlow := &flow.Flow{
+		Model: model.NewFakeModel("sub-model",
+			model.TextResponse("I am the math bot. 42."),
+			model.TextResponse("Still the math bot. 43."),
+		),
+	}
+	subAgent, err := llmagent.New("math_bot", "Solves math", subFlow)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parentFlow := &flow.Flow{
+		Model: model.NewFakeModel("parent-model",
+			model.FunctionCallResponse("Transfer to math.",
+				event.FunctionCall{ID: "fc1", Name: "transfer_to_agent", Args: map[string]any{"agent_name": "math_bot"}},
+			),
+			model.TextResponse("Fallback from parent."),
+		),
+	}
+	parentLLMAgent, err := llmagent.New("root", "Root", parentFlow)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rootCfg := agent.Config{
+		Name:        "root",
+		Description: "Root agent",
+		SubAgents:   []agent.Agent{subAgent},
+		Run: func(ctx agent.InvocationContext) ([]*event.Event, error) {
+			ea, ok := parentLLMAgent.(ExecutableAgent)
+			if !ok {
+				t.Fatal("llm agent does not implement ExecutableAgent")
+			}
+			return ea.Execute(ctx)
+		},
+	}
+	root, err := agent.New(rootCfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootEA, ok := agent.Agent(root).(ExecutableAgent)
+	if !ok {
+		t.Fatal("root does not implement ExecutableAgent")
+	}
+
+	sessionSvc := NewInMemorySessionService()
+	r, err := New(Config{
+		AppName:        "route_app",
+		Agent:          rootEA,
+		SessionService: sessionSvc,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sess, events, err := r.Run(stdctx.Background(), "user-1", "sess-route", "Math question")
+	if err != nil {
+		t.Fatalf("Run 1 error: %v", err)
+	}
+
+	agentToRun := r.findAgentToRun(sess)
+	if agentToRun.Name() != "math_bot" {
+		t.Errorf("findAgentToRun after transfer = %q, want 'math_bot'", agentToRun.Name())
+	}
+
+	sess2, events2, err := r.Run(stdctx.Background(), "user-1", sess.ID(), "Another math question")
+	if err != nil {
+		t.Fatalf("Run 2 error: %v", err)
+	}
+
+	foundMathBot := false
+	for _, ev := range events2 {
+		if ev.Author == "math_bot" {
+			foundMathBot = true
+		}
+	}
+	if !foundMathBot {
+		t.Error("second run should route to math_bot and produce math_bot-authored events")
+	}
+
+	_ = sess2
+	_ = events
 }

@@ -35,11 +35,17 @@ import (
 
 // Agent is the base interface that all agents must implement.
 //
-// TODO: later node — add SubAgents() and FindAgent(name) for agent tree.
-// TODO: later node — switch Run to Go 1.23 iter.Seq2 for streaming.
+// SubAgents returns the direct child agents in the tree.
+// FindAgent performs a depth-first search for an agent by name,
+// returning nil if not found.
 type Agent interface {
 	Name() string
 	Description() string
+	SubAgents() []Agent
+	FindAgent(name string) Agent
+	Parent() Agent
+	DisallowTransferToParent() bool
+	DisallowTransferToPeers() bool
 }
 
 // InvocationContext is the context interface consumed by agent callbacks.
@@ -78,6 +84,11 @@ type Config struct {
 	BeforeAgentCallbacks []BeforeAgentCallback
 	AfterAgentCallbacks  []AfterAgentCallback
 	Run                  func(ctx InvocationContext) ([]*event.Event, error)
+
+	SubAgents                []Agent
+	Parent                   Agent
+	DisallowTransferToParent bool
+	DisallowTransferToPeers  bool
 }
 
 // baseAgent is the concrete implementation.
@@ -88,10 +99,36 @@ type baseAgent struct {
 	beforeAgentCallbacks []BeforeAgentCallback
 	afterAgentCallbacks  []AfterAgentCallback
 	run                  func(ctx InvocationContext) ([]*event.Event, error)
+
+	subAgents                []Agent
+	parent                   Agent
+	disallowTransferToParent bool
+	disallowTransferToPeers  bool
 }
 
-func (a *baseAgent) Name() string        { return a.name }
-func (a *baseAgent) Description() string { return a.description }
+func (a *baseAgent) Name() string                   { return a.name }
+func (a *baseAgent) Description() string            { return a.description }
+func (a *baseAgent) Parent() Agent                  { return a.parent }
+func (a *baseAgent) DisallowTransferToParent() bool { return a.disallowTransferToParent }
+func (a *baseAgent) DisallowTransferToPeers() bool  { return a.disallowTransferToPeers }
+
+// SubAgents returns the direct child agents.
+func (a *baseAgent) SubAgents() []Agent {
+	return append([]Agent(nil), a.subAgents...)
+}
+
+// FindAgent performs a depth-first search for an agent by name.
+func (a *baseAgent) FindAgent(name string) Agent {
+	if a.name == name {
+		return a
+	}
+	for _, sub := range a.subAgents {
+		if found := sub.FindAgent(name); found != nil {
+			return found
+		}
+	}
+	return nil
+}
 
 // PluginManager returns the agent's plugin manager, or nil.
 func (a *baseAgent) PluginManager() *plugin.Manager { return a.pluginManager }
@@ -144,13 +181,71 @@ func New(cfg Config) (*baseAgent, error) {
 		return nil, fmt.Errorf("agent: run function is required")
 	}
 	return &baseAgent{
-		name:                 cfg.Name,
-		description:          cfg.Description,
-		pluginManager:        cfg.PluginManager,
-		beforeAgentCallbacks: cfg.BeforeAgentCallbacks,
-		afterAgentCallbacks:  cfg.AfterAgentCallbacks,
-		run:                  cfg.Run,
+		name:                     cfg.Name,
+		description:              cfg.Description,
+		pluginManager:            cfg.PluginManager,
+		beforeAgentCallbacks:     cfg.BeforeAgentCallbacks,
+		afterAgentCallbacks:      cfg.AfterAgentCallbacks,
+		run:                      cfg.Run,
+		subAgents:                cfg.SubAgents,
+		parent:                   cfg.Parent,
+		disallowTransferToParent: cfg.DisallowTransferToParent,
+		disallowTransferToPeers:  cfg.DisallowTransferToPeers,
 	}, nil
+}
+
+// SetSubAgents replaces the sub-agents list on agents that support mutation.
+// Agent types without a mutator are silently skipped.
+func SetSubAgents(a Agent, subs []Agent) error {
+	ba, ok := a.(*baseAgent)
+	if !ok {
+		if setter, ok := a.(interface{ SetSubAgentsForAgent([]Agent) }); ok {
+			setter.SetSubAgentsForAgent(subs)
+		}
+		return nil
+	}
+	ba.subAgents = append([]Agent(nil), subs...)
+	return nil
+}
+
+// SetParent sets the parent reference on agents that support mutation.
+// Agent types without a mutator are silently skipped.
+func SetParent(a Agent, parent Agent) error {
+	ba, ok := a.(*baseAgent)
+	if !ok {
+		if setter, ok := a.(interface{ SetParentAgent(Agent) }); ok {
+			setter.SetParentAgent(parent)
+		}
+		return nil
+	}
+	ba.parent = parent
+	return nil
+}
+
+// SetDisallowTransferToParent sets the transfer-to-parent constraint on a baseAgent.
+func SetDisallowTransferToParent(a Agent, val bool) error {
+	ba, ok := a.(*baseAgent)
+	if !ok {
+		if setter, ok := a.(interface{ SetDisallowTransferToParentFlag(bool) }); ok {
+			setter.SetDisallowTransferToParentFlag(val)
+		}
+		return nil
+	}
+	ba.disallowTransferToParent = val
+	return nil
+}
+
+// SetDisallowTransferToPeers sets the transfer-to-peers constraint on a baseAgent.
+func SetDisallowTransferToPeers(a Agent, val bool) error {
+	ba, ok := a.(*baseAgent)
+	if !ok {
+		if setter, ok := a.(interface{ SetDisallowTransferToPeersFlag(bool) }); ok {
+			setter.SetDisallowTransferToPeersFlag(val)
+		}
+		return nil
+	}
+	ba.disallowTransferToPeers = val
+	return nil
 }
 
 func runBeforeCallbacks(ctx InvocationContext, cbs []BeforeAgentCallback) (*event.Event, error) {

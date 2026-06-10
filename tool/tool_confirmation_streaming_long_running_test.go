@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/likun666661/rive-adk-go/agent"
 	"github.com/likun666661/rive-adk-go/context"
 	"github.com/likun666661/rive-adk-go/event"
 	"github.com/likun666661/rive-adk-go/session"
@@ -545,8 +546,18 @@ func newTestAgent(name string) *testAgent {
 
 type testAgent struct{ name, desc string }
 
-func (a *testAgent) Name() string        { return a.name }
-func (a *testAgent) Description() string { return a.desc }
+func (a *testAgent) Name() string              { return a.name }
+func (a *testAgent) Description() string       { return a.desc }
+func (a *testAgent) SubAgents() []agent.Agent  { return nil }
+func (a *testAgent) FindAgent(name string) agent.Agent {
+	if a.name == name {
+		return a
+	}
+	return nil
+}
+func (a *testAgent) Parent() agent.Agent           { return nil }
+func (a *testAgent) DisallowTransferToParent() bool { return false }
+func (a *testAgent) DisallowTransferToPeers() bool  { return false }
 
 func newTestSession(id, appName, userID string) session.Session {
 	return session.NewInMemorySession(id, appName, userID)

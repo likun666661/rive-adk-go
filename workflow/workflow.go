@@ -89,9 +89,12 @@ func (c *subCtx) Ended() bool {
 // and no further sub‑agents are executed. Events produced before the
 // failure are still returned.
 type SequentialAgent struct {
-	name        string
-	description string
-	subAgents   []SubAgent
+	name                     string
+	description              string
+	subAgents                []SubAgent
+	parent                   agent.Agent
+	disallowTransferToParent bool
+	disallowTransferToPeers  bool
 }
 
 // NewSequentialAgent creates a SequentialAgent.
@@ -103,8 +106,39 @@ func NewSequentialAgent(name, description string, subAgents []SubAgent) *Sequent
 	}
 }
 
-func (a *SequentialAgent) Name() string        { return a.name }
-func (a *SequentialAgent) Description() string { return a.description }
+func (a *SequentialAgent) Name() string                   { return a.name }
+func (a *SequentialAgent) Description() string            { return a.description }
+func (a *SequentialAgent) Parent() agent.Agent            { return a.parent }
+func (a *SequentialAgent) DisallowTransferToParent() bool { return a.disallowTransferToParent }
+func (a *SequentialAgent) DisallowTransferToPeers() bool  { return a.disallowTransferToPeers }
+
+func (a *SequentialAgent) SetParentAgent(parent agent.Agent) { a.parent = parent }
+func (a *SequentialAgent) SetDisallowTransferToParentFlag(val bool) {
+	a.disallowTransferToParent = val
+}
+func (a *SequentialAgent) SetDisallowTransferToPeersFlag(val bool) {
+	a.disallowTransferToPeers = val
+}
+
+func (a *SequentialAgent) SubAgents() []agent.Agent {
+	result := make([]agent.Agent, len(a.subAgents))
+	for i, s := range a.subAgents {
+		result[i] = s
+	}
+	return result
+}
+
+func (a *SequentialAgent) FindAgent(name string) agent.Agent {
+	if a.name == name {
+		return a
+	}
+	for _, sub := range a.subAgents {
+		if found := sub.FindAgent(name); found != nil {
+			return found
+		}
+	}
+	return nil
+}
 
 // Execute runs sub‑agents sequentially.
 func (a *SequentialAgent) Execute(ctx agent.InvocationContext) ([]*event.Event, error) {
@@ -148,9 +182,12 @@ func (a *SequentialAgent) Execute(ctx agent.InvocationContext) ([]*event.Event, 
 // If multiple sub‑agents return errors, only the first is reported.
 // Successfully produced events are always returned alongside the error.
 type ParallelAgent struct {
-	name        string
-	description string
-	subAgents   []SubAgent
+	name                     string
+	description              string
+	subAgents                []SubAgent
+	parent                   agent.Agent
+	disallowTransferToParent bool
+	disallowTransferToPeers  bool
 }
 
 // NewParallelAgent creates a ParallelAgent.
@@ -162,8 +199,39 @@ func NewParallelAgent(name, description string, subAgents []SubAgent) *ParallelA
 	}
 }
 
-func (a *ParallelAgent) Name() string        { return a.name }
-func (a *ParallelAgent) Description() string { return a.description }
+func (a *ParallelAgent) Name() string                   { return a.name }
+func (a *ParallelAgent) Description() string            { return a.description }
+func (a *ParallelAgent) Parent() agent.Agent            { return a.parent }
+func (a *ParallelAgent) DisallowTransferToParent() bool { return a.disallowTransferToParent }
+func (a *ParallelAgent) DisallowTransferToPeers() bool  { return a.disallowTransferToPeers }
+
+func (a *ParallelAgent) SetParentAgent(parent agent.Agent) { a.parent = parent }
+func (a *ParallelAgent) SetDisallowTransferToParentFlag(val bool) {
+	a.disallowTransferToParent = val
+}
+func (a *ParallelAgent) SetDisallowTransferToPeersFlag(val bool) {
+	a.disallowTransferToPeers = val
+}
+
+func (a *ParallelAgent) SubAgents() []agent.Agent {
+	result := make([]agent.Agent, len(a.subAgents))
+	for i, s := range a.subAgents {
+		result[i] = s
+	}
+	return result
+}
+
+func (a *ParallelAgent) FindAgent(name string) agent.Agent {
+	if a.name == name {
+		return a
+	}
+	for _, sub := range a.subAgents {
+		if found := sub.FindAgent(name); found != nil {
+			return found
+		}
+	}
+	return nil
+}
 
 // pResult holds the output of a single sub‑agent in a parallel run.
 type pResult struct {
@@ -248,10 +316,13 @@ func (a *ParallelAgent) Execute(ctx agent.InvocationContext) ([]*event.Event, er
 // signal: sub‑agents can set event.Actions.Escalate = true to request
 // early termination from within their Run logic.
 type LoopAgent struct {
-	name          string
-	description   string
-	subAgents     []SubAgent
-	maxIterations int
+	name                     string
+	description              string
+	subAgents                []SubAgent
+	maxIterations            int
+	parent                   agent.Agent
+	disallowTransferToParent bool
+	disallowTransferToPeers  bool
 }
 
 // NewLoopAgent creates a LoopAgent.
@@ -267,8 +338,39 @@ func NewLoopAgent(name, description string, subAgents []SubAgent, maxIterations 
 	}
 }
 
-func (a *LoopAgent) Name() string        { return a.name }
-func (a *LoopAgent) Description() string { return a.description }
+func (a *LoopAgent) Name() string                   { return a.name }
+func (a *LoopAgent) Description() string            { return a.description }
+func (a *LoopAgent) Parent() agent.Agent            { return a.parent }
+func (a *LoopAgent) DisallowTransferToParent() bool { return a.disallowTransferToParent }
+func (a *LoopAgent) DisallowTransferToPeers() bool  { return a.disallowTransferToPeers }
+
+func (a *LoopAgent) SetParentAgent(parent agent.Agent) { a.parent = parent }
+func (a *LoopAgent) SetDisallowTransferToParentFlag(val bool) {
+	a.disallowTransferToParent = val
+}
+func (a *LoopAgent) SetDisallowTransferToPeersFlag(val bool) {
+	a.disallowTransferToPeers = val
+}
+
+func (a *LoopAgent) SubAgents() []agent.Agent {
+	result := make([]agent.Agent, len(a.subAgents))
+	for i, s := range a.subAgents {
+		result[i] = s
+	}
+	return result
+}
+
+func (a *LoopAgent) FindAgent(name string) agent.Agent {
+	if a.name == name {
+		return a
+	}
+	for _, sub := range a.subAgents {
+		if found := sub.FindAgent(name); found != nil {
+			return found
+		}
+	}
+	return nil
+}
 
 // Execute runs the loop.
 func (a *LoopAgent) Execute(ctx agent.InvocationContext) ([]*event.Event, error) {

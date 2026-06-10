@@ -1,0 +1,115 @@
+api_version: rive.workflow/v0
+id: rive-adk-go.agent-flow-replica
+version: 2
+title: Rive ADK Go agent flow ReAct multi-agent replica
+params:
+  repo_path:
+    type: string
+    required: true
+  chapter_path:
+    type: string
+    required: true
+  source_repo:
+    type: string
+    required: true
+nodes:
+  implement-agent-transfer-routing:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-a
+    acceptance_mode: auto-reported
+    title: Implement agent tree, transfer tool, and active-agent routing
+    prompt:
+      file: prompts/01-implement-agent-transfer-routing.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  implement-react-policy-extensions:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-b
+    acceptance_mode: auto-reported
+    title: Implement ReAct policy extensions, reflection, and exit loop
+    consumes:
+      - implement-agent-transfer-routing
+    prompt:
+      file: prompts/02-implement-react-policy-extensions.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  integrate-configurable-agent-flow:
+    kind: task
+    runner: opencode
+    worker: opencode-runtime-c
+    acceptance_mode: auto-reported
+    title: Integrate configurable agent flow examples, docs, and demo
+    consumes:
+      - implement-agent-transfer-routing
+      - implement-react-policy-extensions
+    prompt:
+      file: prompts/03-integrate-configurable-agent-flow.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - implemented
+        - files_changed
+        - tests
+        - notes
+  codex-final-merge-agent-flow:
+    kind: review
+    runner: codex
+    worker: codex-runtime-steward
+    acceptance_mode: auto-reported
+    title: Codex final review, fixes, verification, and commit
+    consumes:
+      - implement-agent-transfer-routing
+      - implement-react-policy-extensions
+      - integrate-configurable-agent-flow
+    prompt:
+      file: prompts/04-codex-final-merge-agent-flow.md
+    output_contract:
+      format: markdown
+      required_sections:
+        - review_findings
+        - fixes
+        - verification
+        - commit
+edges:
+  - type: decomposes_to
+    from: root
+    to: implement-agent-transfer-routing
+  - type: decomposes_to
+    from: root
+    to: implement-react-policy-extensions
+  - type: decomposes_to
+    from: root
+    to: integrate-configurable-agent-flow
+  - type: decomposes_to
+    from: root
+    to: codex-final-merge-agent-flow
+  - type: depends_on
+    from: implement-react-policy-extensions
+    to: implement-agent-transfer-routing
+  - type: depends_on
+    from: integrate-configurable-agent-flow
+    to: implement-agent-transfer-routing
+  - type: depends_on
+    from: integrate-configurable-agent-flow
+    to: implement-react-policy-extensions
+  - type: depends_on
+    from: codex-final-merge-agent-flow
+    to: implement-agent-transfer-routing
+  - type: depends_on
+    from: codex-final-merge-agent-flow
+    to: implement-react-policy-extensions
+  - type: depends_on
+    from: codex-final-merge-agent-flow
+    to: integrate-configurable-agent-flow

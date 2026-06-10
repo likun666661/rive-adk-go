@@ -3,9 +3,11 @@ package flow
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 
+	"github.com/likun666661/rive-adk-go/agent"
 	"github.com/likun666661/rive-adk-go/context"
 	"github.com/likun666661/rive-adk-go/event"
 	"github.com/likun666661/rive-adk-go/model"
@@ -19,8 +21,18 @@ import (
 
 type testAgent struct{ name, desc string }
 
-func (a *testAgent) Name() string        { return a.name }
-func (a *testAgent) Description() string { return a.desc }
+func (a *testAgent) Name() string                        { return a.name }
+func (a *testAgent) Description() string                 { return a.desc }
+func (a *testAgent) SubAgents() []agent.Agent            { return nil }
+func (a *testAgent) FindAgent(name string) agent.Agent {
+	if name == a.name {
+		return a
+	}
+	return nil
+}
+func (a *testAgent) Parent() agent.Agent               { return nil }
+func (a *testAgent) DisallowTransferToParent() bool     { return false }
+func (a *testAgent) DisallowTransferToPeers() bool      { return false }
 
 func newTestCtx(name string) context.InvocationContext {
 	a := &testAgent{name: name, desc: "test agent"}
@@ -1069,4 +1081,368 @@ func (c *countingToolset) Name() string { return c.name }
 func (c *countingToolset) Tools() ([]tool.Tool, error) {
 	*c.calls++
 	return c.tools, nil
+}
+
+// =============================================================================
+// Chapter 07 — Agent transfer tests
+// =============================================================================
+
+// newTransferTestCtx creates a context with a parent agent that has sub-agents
+// and a properly configured root agent.
+func newTransferTestCtx(parent agent.Agent) context.InvocationContext {
+	s := session.NewInMemorySession("sid-tf", "app", "user1")
+	return context.NewInvocationContext(context.Params{
+		Agent:        parent,
+		RootAgent:    parent,
+		Session:      s,
+		InvocationID: "inv-tf",
+		Branch:       parent.Name(),
+		UserContent:  "hello",
+	})
+}
+
+func newTransferTargetAgent(name, description, responseText string) agent.Agent {
+	a, err := agent.New(agent.Config{
+		Name:        name,
+		Description: description,
+		Run: func(ctx agent.InvocationContext) ([]*event.Event, error) {
+			return []*event.Event{
+				{
+					ID:      fmt.Sprintf("%s-ev", name),
+					Author:  name,
+					Content: &event.Content{Role: event.RoleModel, Parts: []event.Part{{Text: responseText}}},
+					Branch:  name,
+				},
+			}, nil
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return a
+}
+
+// ---------------------------------------------------------------------------
+// Test 22: model-triggered transfer delegates execution to target agent
+// ---------------------------------------------------------------------------
+
+func TestFlowTransferToSubAgent(t *testing.T) {
+	targetAgent := newTransferTargetAgent("math_bot", "Solves math problems", "The answer is 42.")
+	parentAgent, err := agent.New(agent.Config{
+		Name:        "root",
+		Description: "Root agent",
+		SubAgents:   []agent.Agent{targetAgent},
+		Run:         func(ctx agent.InvocationContext) ([]*event.Event, error) { return nil, nil },
+		Parent:      nil,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := newTransferTestCtx(parentAgent)
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake",
+			model.FunctionCallResponse("Transferring to math_bot.",
+				event.FunctionCall{ID: "fc1", Name: "transfer_to_agent", Args: map[string]any{"agent_name": "math_bot"}},
+			),
+		),
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// Should have: model event (transfer fc), tool result, target agent events
+	if len(events) < 3 {
+		t.Fatalf("expected at least 3 events (model + tool + target), got %d", len(events))
+	}
+
+	// Event 1: model response with transfer_to_agent function call
+	ev1 := events[0]
+	if ev1.Role != event.RoleModel {
+		t.Errorf("event 1 role = %q, want 'model'", ev1.Role)
+	}
+	if !ev1.HasFunctionCalls() {
+		t.Error("event 1 should have function calls (transfer_to_agent)")
+	}
+
+	// Event 2: tool result with TransferToAgent action
+	ev2 := events[1]
+	if ev2.Role != event.RoleTool {
+		t.Errorf("event 2 role = %q, want 'tool'", ev2.Role)
+	}
+	if ev2.Actions.TransferToAgent != "math_bot" {
+		t.Errorf("TransferToAgent = %q, want 'math_bot'", ev2.Actions.TransferToAgent)
+	}
+
+	// Last event should be from the target agent
+	lastEv := events[len(events)-1]
+	if lastEv.Author != "math_bot" {
+		t.Errorf("last event Author = %q, want 'math_bot'", lastEv.Author)
+	}
+	if lastEv.Content == nil || len(lastEv.Content.Parts) == 0 {
+		t.Fatal("target event should have content")
+	}
+	if lastEv.Content.Parts[0].Text != "The answer is 42." {
+		t.Errorf("target text = %q, want 'The answer is 42.'", lastEv.Content.Parts[0].Text)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 23: invalid transfer target yields structured tool error
+// ---------------------------------------------------------------------------
+
+func TestFlowTransferInvalidTarget(t *testing.T) {
+	targetAgent := newTransferTargetAgent("math_bot", "Solves math", "42")
+	parentAgent, err := agent.New(agent.Config{
+		Name:        "root",
+		Description: "Root agent",
+		SubAgents:   []agent.Agent{targetAgent},
+		Run:         func(ctx agent.InvocationContext) ([]*event.Event, error) { return nil, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := newTransferTestCtx(parentAgent)
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake",
+			// The transfer tool IS injected (because there are sub-agents),
+			// but the target name is invalid.
+			model.FunctionCallResponse("Transferring to nonexistent.",
+				event.FunctionCall{ID: "fc1", Name: "transfer_to_agent", Args: map[string]any{"agent_name": "nonexistent"}},
+			),
+			model.TextResponse("Fallback: I could not transfer."),
+		),
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// Should get: model event with fc, tool error, model final
+	if len(events) < 3 {
+		t.Fatalf("expected at least 3 events, got %d", len(events))
+	}
+
+	// The tool event should have error about invalid target
+	toolEv := events[1]
+	if toolEv.ErrorMessage == "" {
+		t.Error("tool error event should have ErrorMessage")
+	}
+	if !strings.Contains(toolEv.ErrorMessage, "nonexistent") {
+		t.Errorf("error message = %q, should mention 'nonexistent'", toolEv.ErrorMessage)
+	}
+	if toolEv.Content != nil && len(toolEv.Content.Parts) > 0 {
+		fr := toolEv.Content.Parts[0].FunctionResponse
+		if fr == nil || fr.Name != "transfer_to_agent" {
+			t.Errorf("expected transfer_to_agent function response, got %v", fr)
+		}
+		if fr.Error == "" || !strings.Contains(fr.Error, "nonexistent") {
+			t.Errorf("function response error = %q, should mention 'nonexistent'", fr.Error)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Test 24: transfer loop detection (max depth guard)
+// ---------------------------------------------------------------------------
+
+func TestFlowTransferLoopDetection(t *testing.T) {
+	// Create two agents that recursively transfer to each other
+	// root <-> child
+	transferEv := func(targetName string) *event.Event {
+		return &event.Event{
+			ID:      fmt.Sprintf("fc-%s", targetName),
+			Author:  targetName,
+			Actions: event.EventActions{TransferToAgent: targetName},
+		}
+	}
+
+	child, err := agent.New(agent.Config{
+		Name:        "child",
+		Description: "Child agent",
+		Run: func(ctx agent.InvocationContext) ([]*event.Event, error) {
+			return []*event.Event{transferEv("root")}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rootAgent, err := agent.New(agent.Config{
+		Name:        "root",
+		Description: "Root agent",
+		SubAgents:   []agent.Agent{child},
+		Run: func(ctx agent.InvocationContext) ([]*event.Event, error) {
+			return []*event.Event{transferEv("child")}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := newTransferTestCtx(rootAgent)
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake",
+			model.FunctionCallResponse("Transferring to child.",
+				event.FunctionCall{ID: "fc1", Name: "transfer_to_agent", Args: map[string]any{"agent_name": "child"}},
+			),
+		),
+	}
+
+	_, err = f.Run(ctx)
+	if err == nil {
+		t.Fatal("expected transfer loop error, got nil")
+	}
+	if !strings.Contains(err.Error(), "transfer loop detected") {
+		t.Errorf("error = %q, should contain 'transfer loop detected'", err.Error())
+	}
+	if !strings.Contains(err.Error(), "max depth") {
+		t.Errorf("error = %q, should contain 'max depth'", err.Error())
+	}
+}
+
+// TestFlowTransferToParent tests transfer from child to parent.
+func TestFlowTransferToParent(t *testing.T) {
+	parentAgent, err := agent.New(agent.Config{
+		Name:        "parent",
+		Description: "Parent agent",
+		Run: func(ctx agent.InvocationContext) ([]*event.Event, error) {
+			return []*event.Event{
+				{
+					ID:      "parent-ev",
+					Author:  "parent",
+					Content: &event.Content{Role: event.RoleModel, Parts: []event.Part{{Text: "Parent handled it."}}},
+					Branch:  "parent",
+				},
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	childAgent, err := agent.New(agent.Config{
+		Name:        "child",
+		Description: "Child agent",
+		Parent:      parentAgent,
+		Run:         func(ctx agent.InvocationContext) ([]*event.Event, error) { return nil, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Set up parent with child as sub-agent so FindAgent can find it.
+	// Recreate parent with child as SubAgent
+	parentWithChild, err := agent.New(agent.Config{
+		Name:        "parent",
+		Description: "Parent agent",
+		SubAgents:   []agent.Agent{childAgent},
+		Run: func(ctx agent.InvocationContext) ([]*event.Event, error) {
+			return []*event.Event{
+				{
+					ID:      "parent-ev",
+					Author:  "parent",
+					Content: &event.Content{Role: event.RoleModel, Parts: []event.Part{{Text: "Parent handled it."}}},
+					Branch:  "parent",
+				},
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Use parent as root and child as current agent
+	ctx := newTransferTestCtx(parentWithChild)
+	// Override context to have child as current agent but parent as root
+	s := session.NewInMemorySession("sid-tf2", "app", "user1")
+	ctx = context.NewInvocationContext(context.Params{
+		Agent:        childAgent,
+		RootAgent:    parentWithChild,
+		Session:      s,
+		InvocationID: "inv-tf2",
+		Branch:       "child",
+		UserContent:  "hello",
+	})
+
+	f := &Flow{
+		Model: model.NewFakeModel("fake",
+			model.FunctionCallResponse("Transferring to parent.",
+				event.FunctionCall{ID: "fc1", Name: "transfer_to_agent", Args: map[string]any{"agent_name": "parent"}},
+			),
+		),
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	if len(events) < 3 {
+		t.Fatalf("expected at least 3 events, got %d", len(events))
+	}
+
+	// Transfer should set the action
+	ev2 := events[1]
+	if ev2.Actions.TransferToAgent != "parent" {
+		t.Errorf("TransferToAgent = %q, want 'parent'", ev2.Actions.TransferToAgent)
+	}
+
+	// Last event should be from parent
+	lastEv := events[len(events)-1]
+	if lastEv.Author != "parent" {
+		t.Errorf("last event Author = %q, want 'parent'", lastEv.Author)
+	}
+}
+
+func TestFlowTransferWithoutSubAgentsHasEmptyTargets(t *testing.T) {
+	agentWithoutSubs, err := agent.New(agent.Config{
+		Name:                     "loner",
+		Description:              "Loner agent",
+		DisallowTransferToParent: true,
+		DisallowTransferToPeers:  true,
+		Run:                      func(ctx agent.InvocationContext) ([]*event.Event, error) { return nil, nil },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := newTransferTestCtx(agentWithoutSubs)
+
+	// Model calls transfer_to_agent but agent has no transfer targets
+	f := &Flow{
+		Model: model.NewFakeModel("fake",
+			model.FunctionCallResponse("Trying to transfer.",
+				event.FunctionCall{ID: "fc1", Name: "transfer_to_agent", Args: map[string]any{"agent_name": "anyone"}},
+			),
+			model.TextResponse("Final response."),
+		),
+	}
+
+	events, err := f.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+
+	// Since there are no transfer targets, the transfer tool is NOT injected.
+	// So transfer_to_agent should be treated as a regular tool not found error.
+	if len(events) < 3 {
+		t.Fatalf("expected at least 3 events (model fc, tool error, model final), got %d", len(events))
+	}
+
+	// Event 2 should be a tool-not-found error
+	ev2 := events[1]
+	if ev2.Role != event.RoleTool {
+		t.Errorf("event 2 role = %q, want 'tool'", ev2.Role)
+	}
+	if ev2.ErrorMessage == "" {
+		t.Error("expected error message for tool not found")
+	}
 }

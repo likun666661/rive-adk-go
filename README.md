@@ -12,6 +12,7 @@ deep-read guides:
 - **Chapter 04**: Callbacks / plugins / instruction injection
 - **Chapter 05**: Multi-agent composition — workflows, AgentTool, remote A2A
 - **Chapter 06**: Entrypoints, deploy, and telemetry — console/web routing, REST/SSE, dry-run deploy plans, instrumentation model
+- **Chapter 07**: Configurable agent flow — ReAct loop, agent transfer, ExitLoop/retry-reflect/hidden-arg policies, JSON config loader
 
 The implementation is produced through a Rive workflow:
 
@@ -65,8 +66,12 @@ The implementation is produced through a Rive workflow:
 | `memory` | Cross-session long-term memory with keyword search |
 | `artifact` | Versioned file store scoped by app/user/session |
 | `workflow` | Sequential, parallel, and loop agent orchestration |
+| `agent/agentconfig` | JSON config loader: builds agent trees from declarative config with validation |
 | `tool/agenttool` | Agent-as-tool: wraps an agent as a FunctionTool with isolated child session |
 | `agent/remoteagent` | Remote A2A bridge: streaming, conversion, partial aggregation, cleanup |
+| `tool/exitloop` | ExitLoop tool: LLM-callable early loop termination signal |
+| `plugin/retryreflect` | RetryAndReflect plugin: tool error recovery with reflection guidance |
+| `plugin/functionmodifier` | FunctionCallModifier plugin: inject/strip hidden args from tool declarations |
 | `cmd/launcher` | Entrypoint abstractions: Config, Launcher, SubLauncher, AgentLoader |
 | `cmd/launcher/universal` | Keyword-based router; first sublauncher is default |
 | `cmd/launcher/console` | Interactive console driving `runner.Run` from stdin |
@@ -162,6 +167,42 @@ Output shows:
   console/web routing, REST JSON/SSE protocols, deterministic dry-run deploy
   plans (Cloud Run + Agent Engine), and in-memory telemetry recorder with
   span/log instrumentation around runner invocations.
+- Chapter 07 — configurable agent flow: ReAct function-call loop, agent
+  transfer via transfer_to_agent (host → specialist), policy extensions
+  (ExitLoop, retry/reflect, hidden args), and configurable agent tree
+  construction from a JSON config file with duplicate/type/tool validation.
+
+---
+
+## Chapter 07: Configurable Agent Flow
+
+Chapter 07 extends the Chapter 01-06 runtime rather than replacing it. The
+same `runner.Run -> agent.Execute -> flow.Flow -> model/tool -> event/session`
+path now also demonstrates:
+
+- ReAct iteration as repeated model calls, function calls, tool result events,
+  and final model responses.
+- `transfer_to_agent` as a structured tool action recorded in
+  `EventActions.TransferToAgent`, not as plain text.
+- Active-agent routing from session history, so a later user turn can continue
+  with the last transferable specialist agent.
+- Agent tree metadata (`SubAgents`, `Parent`, `FindAgent`) and transfer
+  constraints for parent/peer routing.
+- Policy hooks for `ExitLoop`, retry/reflection on tool errors, and hidden
+  function-call args.
+- A small JSON config loader for building teaching examples with `llm_agent`,
+  `sequential`, `parallel`, and `loop` nodes.
+
+Deliberate simplifications:
+
+- Config is JSON only; YAML and production deployment config are omitted.
+- Config-built LLM agents use deterministic `FakeModel` instances. Real model
+  provider selection is left as an extension point.
+- Plugin and instruction configuration are not represented in JSON.
+- Streaming and partial aggregation remain the simplified behavior introduced
+  in earlier chapters.
+- This replica teaches the architecture shape; it is not API-compatible with
+  `google/adk-go`.
 
 ---
 
