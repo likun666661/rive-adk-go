@@ -94,8 +94,8 @@ type Flow struct {
 	BeforeToolCallbacksCtx  []BeforeToolCallbackCtx
 	AfterToolCallbacksCtx   []AfterToolCallbackCtx
 
-	resolvedTools     map[string]tool.Tool
-	resolvedToolList  []tool.Tool
+	resolvedTools      map[string]tool.Tool
+	resolvedToolList   []tool.Tool
 	activeTransferTool *transfer.TransferToAgentTool
 }
 
@@ -112,7 +112,7 @@ func (f *Flow) Run(ctx context.InvocationContext) ([]*event.Event, error) {
 			return allEvents, nil
 		}
 
-		stepEvents, err := f.runOneStep(ctx, step)
+		stepEvents, err := f.runOneStep(ctx, step, allEvents)
 		if err != nil {
 			return allEvents, err
 		}
@@ -148,11 +148,14 @@ func (f *Flow) Run(ctx context.InvocationContext) ([]*event.Event, error) {
 
 // runOneStep executes a single iteration: preprocess → callModel → postprocess
 // → finalizeEvent → yield → handleFunctionCalls → handleTransfer.
-func (f *Flow) runOneStep(ctx context.InvocationContext, step int) ([]*event.Event, error) {
+func (f *Flow) runOneStep(ctx context.InvocationContext, step int, priorEvents []*event.Event) ([]*event.Event, error) {
 	currentAgent := ctx.Agent()
 
+	history := append([]*event.Event{}, ctx.Session().Events()...)
+	history = append(history, priorEvents...)
 	req := &model.LLMRequest{
-		Model: f.Model.Name(),
+		Model:    f.Model.Name(),
+		Contents: model.ContentsFromEvents(history),
 	}
 
 	ev, err := f.preprocess(ctx, req)
@@ -848,6 +851,6 @@ type transferContext struct {
 	depth       int
 }
 
-func (c *transferContext) Agent() agent.Agent   { return c.targetAgent }
-func (c *transferContext) AgentName() string      { return c.targetAgent.Name() }
-func (c *transferContext) Branch() string          { return c.branch }
+func (c *transferContext) Agent() agent.Agent { return c.targetAgent }
+func (c *transferContext) AgentName() string  { return c.targetAgent.Name() }
+func (c *transferContext) Branch() string     { return c.branch }

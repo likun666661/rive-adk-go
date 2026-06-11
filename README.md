@@ -172,6 +172,26 @@ Output shows:
   (ExitLoop, retry/reflect, hidden args), and configurable agent tree
   construction from a JSON config file with duplicate/type/tool validation.
 
+## Real LLM Smoke
+
+The default demo uses `FakeModel` for deterministic tests. To verify the same
+runner/flow/tool loop against a real OpenAI-compatible backend, run:
+
+```bash
+DEEPSEEK_API_KEY=... go run ./cmd/realllm
+```
+
+Optional environment:
+
+- `DEEPSEEK_MODEL` (default: `deepseek-chat`)
+- `DEEPSEEK_BASE_URL` (default: `https://api.deepseek.com/v1`)
+- `ADKGO_REAL_LLM_PROMPT` (default asks the model to call `get_weather`)
+
+The smoke succeeds only if the real model calls `get_weather`, the tool result
+is fed into the next model turn, and a final answer is produced. This exercises
+the same `Runner -> Agent -> Flow -> Model/Tool -> Event -> Session` path as the
+fake demo, but uses the `model.OpenAICompatibleModel` adapter.
+
 ---
 
 ## Chapter 07: Configurable Agent Flow
